@@ -12155,19 +12155,42 @@ _record_critical (const gchar *domain, GLogLevelFlags level,
  * @brief Releasing a tensor_split that never got a tensorseg says nothing.
  * @details finalize releases the rule array, which is unset here; releasing an
  *          unset one the wrong way logs a critical rather than doing nothing.
+ *          Critical messages are recorded in the GLib domain used by
+ *          g_array_unref() and in the default domain used by ml_loge().
  */
 TEST (testTensorSplit, finalizeWithoutTensorseg)
 {
   GstElement *split = gst_element_factory_make ("tensor_split", NULL);
-  GLogFunc old_handler;
+  const GLogLevelFlags levels
+      = (GLogLevelFlags) (G_LOG_LEVEL_CRITICAL | G_LOG_FLAG_FATAL | G_LOG_FLAG_RECURSION);
+  guint glib_handler, default_handler;
+  gboolean glib_recorded, default_recorded;
+  GLogLevelFlags fatal_mask;
 
   ASSERT_TRUE (split != NULL);
   gst_object_ref_sink (split);
 
+  /* g_array_unref() reports invalid arguments in the GLib domain;
+   * ml_loge() logs to the default domain. */
+  glib_handler = g_log_set_handler ("GLib", levels, _record_critical, NULL);
+  default_handler = g_log_set_handler (NULL, levels, _record_critical, NULL);
+
+  /* Only the intentional probes may bypass fatal handling of critical messages. */
+  fatal_mask = g_log_set_always_fatal ((GLogLevelFlags) G_LOG_FATAL_MASK);
   tensor_split_logged_critical = FALSE;
-  old_handler = g_log_set_default_handler (_record_critical, NULL);
+  g_log ("GLib", G_LOG_LEVEL_CRITICAL, "tensor_split test: GLib handler self-check");
+  glib_recorded = tensor_split_logged_critical;
+  tensor_split_logged_critical = FALSE;
+  g_log (NULL, G_LOG_LEVEL_CRITICAL, "tensor_split test: default handler self-check");
+  default_recorded = tensor_split_logged_critical;
+  g_log_set_always_fatal (fatal_mask);
+  EXPECT_TRUE (glib_recorded);
+  EXPECT_TRUE (default_recorded);
+
+  tensor_split_logged_critical = FALSE;
   gst_object_unref (split);
-  g_log_set_default_handler (old_handler, NULL);
+  g_log_remove_handler (NULL, default_handler);
+  g_log_remove_handler ("GLib", glib_handler);
 
   EXPECT_FALSE (tensor_split_logged_critical);
 }
