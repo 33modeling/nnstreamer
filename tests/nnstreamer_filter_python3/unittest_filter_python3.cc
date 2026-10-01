@@ -9,8 +9,11 @@
  *
  */
 #include <gtest/gtest.h>
+#include <Python.h>
 #include <glib.h>
+#include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
+#include <unittest_python3_util.h>
 #include <unittest_util.h>
 
 #include <nnstreamer_plugin_api_filter.h>
@@ -292,6 +295,687 @@ TEST (nnstreamerFilterPython3, invoke01)
   g_free (input.data);
   g_free (output.data);
   sp->close (&prop, &data);
+}
+
+/**
+ * @brief Fixture running filter_output_cases.py in the case given as custom.
+ * @note The script takes a uint8 tensor of 8 and gives two uint8 tensors of 4.
+ */
+class nnstreamerFilterPython3Output : public ::testing::Test
+{
+  protected:
+  const GstTensorFilterFramework *sp;
+  GstTensorFilterProperties prop;
+  gchar *model_file;
+  const gchar *model_files[2];
+  void *data;
+  guint8 in_data[8];
+  guint8 unset[2][4];
+  GstTensorMemory input;
+  GstTensorMemory output[2];
+
+  /**
+   * @brief Prepare the properties and the tensors for a case.
+   */
+  void SetUp () override
+  {
+    const gchar *root_path = g_getenv ("NNSTREAMER_SOURCE_ROOT_PATH");
+
+    model_file = g_build_filename (root_path, "tests", "test_models", "models",
+        "filter_output_cases.py", NULL);
+    model_files[0] = model_file;
+    model_files[1] = NULL;
+    data = NULL;
+
+    sp = nnstreamer_filter_find ("python3");
+    ASSERT_NE (sp, nullptr);
+    _SetFilterProp (&prop, "python3", model_files);
+
+    gst_tensors_info_init (&prop.input_meta);
+    prop.input_meta.num_tensors = 1;
+    prop.input_meta.info[0].type = _NNS_UINT8;
+    gst_tensor_parse_dimension ("8", prop.input_meta.info[0].dimension);
+
+    gst_tensors_info_init (&prop.output_meta);
+    prop.output_meta.num_tensors = 2;
+    for (guint i = 0; i < 2; i++) {
+      prop.output_meta.info[i].type = _NNS_UINT8;
+      gst_tensor_parse_dimension ("4", prop.output_meta.info[i].dimension);
+    }
+
+    for (guint i = 0; i < 8; i++)
+      in_data[i] = (guint8) (i + 10);
+    input.data = in_data;
+    input.size = sizeof (in_data);
+
+    resetOutput ();
+  }
+
+  /**
+   * @brief Close the filter and release the properties.
+   */
+  void TearDown () override
+  {
+    if (sp)
+      sp->close (&prop, &data);
+    gst_tensors_info_free (&prop.input_meta);
+    gst_tensors_info_free (&prop.output_meta);
+    g_free (model_file);
+  }
+
+  /**
+   * @brief Point the output tensors at buffers the script cannot own.
+   */
+  void resetOutput ()
+  {
+    for (guint i = 0; i < 2; i++) {
+      output[i].data = unset[i];
+      output[i].size = sizeof (unset[i]);
+    }
+  }
+
+  /**
+   * @brief Open the script with the given case.
+   */
+  int openCase (const gchar *mode)
+  {
+    prop.custom_properties = mode;
+    return sp->open (&prop, &data);
+  }
+
+  /**
+   * @brief Give an output tensor back to the script, as tensor_filter does.
+   */
+  void release (void *out)
+  {
+    GstTensorFilterFrameworkEventData event;
+
+    event.data = out;
+    EXPECT_EQ (sp->eventHandler (sp, &prop, data, DESTROY_NOTIFY, &event), 0);
+  }
+
+  /**
+   * @brief Check that the output tensor holds what is expected and is not the input.
+   */
+  void expectOutput (guint idx, const guint8 *expected)
+  {
+    const guint8 *out = (const guint8 *) output[idx].data;
+
+    ASSERT_NE (out, nullptr);
+    EXPECT_NE (out, unset[idx]);
+    EXPECT_TRUE (out < in_data || out >= in_data + sizeof (in_data));
+    EXPECT_EQ (memcmp (out, expected, 4), 0);
+  }
+
+  /**
+   * @brief Check that a failed invoke left the output tensors untouched.
+   */
+  void expectNoOutput ()
+  {
+    EXPECT_EQ (output[0].data, (void *) unset[0]);
+    EXPECT_EQ (output[1].data, (void *) unset[1]);
+  }
+
+  /**
+   * @brief Check that the next invoke of the same script works, i.e., a failure
+   *        leaves no error behind. A failing case of the script fails only once.
+   */
+  void expectRecovered ()
+  {
+    const guint8 first[4] = { 10, 11, 12, 13 };
+
+    resetOutput ();
+    ASSERT_EQ (sp->invoke (sp, &prop, data, &input, output), 0);
+    expectOutput (0, first);
+    release (output[0].data);
+    release (output[1].data);
+  }
+};
+
+/**
+ * @brief Positive case with the outputs the script allocates itself
+ */
+TEST_F (nnstreamerFilterPython3Output, copy)
+{
+  const guint8 first[4] = { 10, 11, 12, 13 };
+  const guint8 second[4] = { 14, 15, 16, 17 };
+
+  ASSERT_EQ (openCase ("copy"), 0);
+  ASSERT_EQ (sp->invoke (sp, &prop, data, &input, output), 0);
+
+  expectOutput (0, first);
+  expectOutput (1, second);
+  release (output[0].data);
+  release (output[1].data);
+}
+
+/**
+ * @brief Outputs that are views of the input tensor are handed out as a copy
+ */
+TEST_F (nnstreamerFilterPython3Output, aliasInput)
+{
+  const guint8 first[4] = { 10, 11, 12, 13 };
+  const guint8 second[4] = { 14, 15, 16, 17 };
+
+  ASSERT_EQ (openCase ("alias"), 0);
+  ASSERT_EQ (sp->invoke (sp, &prop, data, &input, output), 0);
+
+  expectOutput (0, first);
+  expectOutput (1, second);
+  release (output[0].data);
+  release (output[1].data);
+}
+
+/**
+ * @brief Strided outputs (positive and negative steps) are made contiguous
+ */
+TEST_F (nnstreamerFilterPython3Output, nonContiguous)
+{
+  const guint8 first[4] = { 0, 2, 4, 6 };
+  const guint8 second[4] = { 7, 5, 3, 1 };
+
+  ASSERT_EQ (openCase ("strided"), 0);
+  ASSERT_EQ (sp->invoke (sp, &prop, data, &input, output), 0);
+
+  expectOutput (0, first);
+  expectOutput (1, second);
+  release (output[0].data);
+  release (output[1].data);
+}
+
+/**
+ * @brief One array returned for both outputs gives two separate buffers
+ */
+TEST_F (nnstreamerFilterPython3Output, sameArrayTwice)
+{
+  const guint8 expected[4] = { 0, 1, 2, 3 };
+
+  ASSERT_EQ (openCase ("same"), 0);
+  ASSERT_EQ (sp->invoke (sp, &prop, data, &input, output), 0);
+
+  expectOutput (0, expected);
+  expectOutput (1, expected);
+  EXPECT_NE (output[0].data, output[1].data);
+  release (output[0].data);
+  release (output[1].data);
+}
+
+/**
+ * @brief An array the script keeps is not handed out again while in use
+ */
+TEST_F (nnstreamerFilterPython3Output, keptArray)
+{
+  const guint8 first[4] = { 0, 1, 2, 3 };
+  const guint8 second[4] = { 14, 15, 16, 17 };
+  void *prev[2];
+
+  ASSERT_EQ (openCase ("kept"), 0);
+  ASSERT_EQ (sp->invoke (sp, &prop, data, &input, output), 0);
+  expectOutput (0, first);
+  prev[0] = output[0].data;
+  prev[1] = output[1].data;
+
+  resetOutput ();
+  ASSERT_EQ (sp->invoke (sp, &prop, data, &input, output), 0);
+  expectOutput (0, first);
+  expectOutput (1, second);
+  EXPECT_NE (output[0].data, prev[0]);
+
+  release (prev[0]);
+  release (prev[1]);
+  release (output[0].data);
+  release (output[1].data);
+}
+
+/**
+ * @brief Negative case with an output that is not a numpy array
+ */
+TEST_F (nnstreamerFilterPython3Output, notArray_n)
+{
+  ASSERT_EQ (openCase ("not_array"), 0);
+  EXPECT_NE (sp->invoke (sp, &prop, data, &input, output), 0);
+  expectNoOutput ();
+  expectRecovered ();
+}
+
+/**
+ * @brief Negative case with outputs given as a tuple instead of a list
+ */
+TEST_F (nnstreamerFilterPython3Output, notList_n)
+{
+  ASSERT_EQ (openCase ("not_list"), 0);
+  EXPECT_NE (sp->invoke (sp, &prop, data, &input, output), 0);
+  expectNoOutput ();
+  expectRecovered ();
+}
+
+/**
+ * @brief Negative case with fewer outputs than the model gives
+ */
+TEST_F (nnstreamerFilterPython3Output, wrongCount_n)
+{
+  ASSERT_EQ (openCase ("count"), 0);
+  EXPECT_NE (sp->invoke (sp, &prop, data, &input, output), 0);
+  expectNoOutput ();
+  expectRecovered ();
+}
+
+/**
+ * @brief Negative case with a valid first output and an invalid second one
+ */
+TEST_F (nnstreamerFilterPython3Output, secondInvalid_n)
+{
+  ASSERT_EQ (openCase ("second_bad"), 0);
+  EXPECT_NE (sp->invoke (sp, &prop, data, &input, output), 0);
+  expectNoOutput ();
+  expectRecovered ();
+}
+
+/**
+ * @brief Negative case with an output of the right type but fewer bytes
+ */
+TEST_F (nnstreamerFilterPython3Output, shortOutput_n)
+{
+  ASSERT_EQ (openCase ("short"), 0);
+  EXPECT_NE (sp->invoke (sp, &prop, data, &input, output), 0);
+  expectNoOutput ();
+  expectRecovered ();
+}
+
+/**
+ * @brief Negative case with an output of the right size but another type
+ */
+TEST_F (nnstreamerFilterPython3Output, wrongType_n)
+{
+  ASSERT_EQ (openCase ("int8"), 0);
+  EXPECT_NE (sp->invoke (sp, &prop, data, &input, output), 0);
+  expectNoOutput ();
+  expectRecovered ();
+}
+
+/**
+ * @brief Negative case with a script raising an exception in invoke
+ */
+TEST_F (nnstreamerFilterPython3Output, raise_n)
+{
+  ASSERT_EQ (openCase ("raise"), 0);
+  EXPECT_NE (sp->invoke (sp, &prop, data, &input, output), 0);
+  expectNoOutput ();
+  expectRecovered ();
+}
+
+/**
+ * @brief Negative case with a script whose constructor fails, twice
+ */
+TEST_F (nnstreamerFilterPython3Output, openInitError_n)
+{
+  PyGILState_STATE gstate;
+  PyObject *module, *cls;
+  Py_ssize_t module_ref, cls_ref;
+
+  /* the first attempt imports the script */
+  EXPECT_NE (openCase ("init_error"), 0);
+
+  gstate = PyGILState_Ensure ();
+  module = PyImport_ImportModule ("filter_output_cases");
+  cls = module ? PyObject_GetAttrString (module, "CustomFilter") : NULL;
+  module_ref = module ? Py_REFCNT (module) : 0;
+  cls_ref = cls ? Py_REFCNT (cls) : 0;
+  PyGILState_Release (gstate);
+  ASSERT_NE (module, nullptr);
+  ASSERT_NE (cls, nullptr);
+
+  EXPECT_NE (openCase ("init_error"), 0);
+  EXPECT_EQ (data, nullptr);
+
+  gstate = PyGILState_Ensure ();
+  EXPECT_EQ (Py_REFCNT (module), module_ref);
+  EXPECT_EQ (Py_REFCNT (cls), cls_ref);
+  Py_DECREF (cls);
+  Py_DECREF (module);
+  PyGILState_Release (gstate);
+}
+
+/**
+ * @brief Callback for tensor sink signal, appends the data of every buffer.
+ */
+static void
+_python3_new_data_cb (GstElement *element, GstBuffer *buffer, gpointer user_data)
+{
+  GByteArray *received = (GByteArray *) user_data;
+  GstMapInfo map;
+
+  UNUSED (element);
+  for (guint i = 0; i < gst_buffer_n_memory (buffer); i++) {
+    GstMemory *mem = gst_buffer_peek_memory (buffer, i);
+
+    ASSERT_TRUE (gst_memory_map (mem, &map, GST_MAP_READ));
+    g_byte_array_append (received, map.data, map.size);
+    gst_memory_unmap (mem, &map);
+  }
+}
+
+/**
+ * @brief Push one buffer to tensor_filter running filter_output_cases.py.
+ * @return the type of the message ending the stream (EOS or ERROR).
+ */
+static GstMessageType
+_python3_run_pipeline (const gchar *mode, GByteArray *received)
+{
+  const gchar *root_path = g_getenv ("NNSTREAMER_SOURCE_ROOT_PATH");
+  GstMessageType result = GST_MESSAGE_UNKNOWN;
+  GstElement *pipeline, *src, *sink;
+  GstMessage *msg;
+  GstBus *bus;
+  gchar *model_file, *desc;
+  guint8 *in_data = (guint8 *) g_malloc (8);
+
+  for (guint i = 0; i < 8; i++)
+    in_data[i] = (guint8) (i + 10);
+
+  model_file = g_build_filename (root_path, "tests", "test_models", "models",
+      "filter_output_cases.py", NULL);
+  desc = g_strdup_printf (
+      "appsrc name=srcx caps=\"other/tensors,num_tensors=1,dimensions=(string)8,types=(string)uint8,format=static,framerate=0/1\" ! "
+      "tensor_filter framework=python3 model=\"%s\" custom=%s input=8 inputtype=uint8 "
+      "output=4,4 outputtype=uint8,uint8 ! tensor_sink name=sinkx async=false",
+      model_file, mode);
+  pipeline = gst_parse_launch (desc, NULL);
+  g_free (desc);
+  g_free (model_file);
+  if (!pipeline) {
+    g_free (in_data);
+    return GST_MESSAGE_ANY;
+  }
+
+  src = gst_bin_get_by_name (GST_BIN (pipeline), "srcx");
+  sink = gst_bin_get_by_name (GST_BIN (pipeline), "sinkx");
+  g_signal_connect (sink, "new-data", (GCallback) _python3_new_data_cb, received);
+
+  if (setPipelineStateSync (pipeline, GST_STATE_PLAYING, UNITTEST_STATECHANGE_TIMEOUT) == 0) {
+    gst_app_src_push_buffer (GST_APP_SRC (src), gst_buffer_new_wrapped (in_data, 8));
+    gst_app_src_end_of_stream (GST_APP_SRC (src));
+
+    bus = gst_element_get_bus (pipeline);
+    msg = gst_bus_timed_pop_filtered (bus, 5 * GST_SECOND,
+        (GstMessageType) (GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+    if (msg) {
+      result = GST_MESSAGE_TYPE (msg);
+      gst_message_unref (msg);
+    }
+    gst_object_unref (bus);
+  } else {
+    g_free (in_data);
+  }
+
+  gst_element_set_state (pipeline, GST_STATE_NULL);
+  gst_object_unref (src);
+  gst_object_unref (sink);
+  gst_object_unref (pipeline);
+  return result;
+}
+
+/**
+ * @brief tensor_filter pushes the copied outputs of a script returning input views
+ */
+TEST (nnstreamerFilterPython3, pipelineAliasInput)
+{
+  const guint8 expected[8] = { 10, 11, 12, 13, 14, 15, 16, 17 };
+  GByteArray *received = g_byte_array_new ();
+
+  EXPECT_EQ (_python3_run_pipeline ("alias", received), GST_MESSAGE_EOS);
+  ASSERT_EQ (received->len, 8U);
+  EXPECT_EQ (memcmp (received->data, expected, 8), 0);
+  g_byte_array_unref (received);
+}
+
+/**
+ * @brief tensor_filter stops the stream instead of pushing an invalid output
+ */
+TEST (nnstreamerFilterPython3, pipelineSecondInvalid_n)
+{
+  GByteArray *received = g_byte_array_new ();
+
+  EXPECT_EQ (_python3_run_pipeline ("second_bad", received), GST_MESSAGE_ERROR);
+  EXPECT_EQ (received->len, 0U);
+  g_byte_array_unref (received);
+}
+
+/**
+ * @brief Build the path of a script under tests/test_models/models
+ */
+static gchar *
+_python3_model_path (const gchar *name)
+{
+  return g_build_filename (g_getenv ("NNSTREAMER_SOURCE_ROOT_PATH"), "tests",
+      "test_models", "models", name, NULL);
+}
+
+/**
+ * @brief Setting the input dimension releases the tensor shapes built for the script.
+ */
+TEST (nnstreamerFilterPython3, setInputDimRepeatedKeepsObjects)
+{
+  void *data = NULL;
+  gchar *model_file = _python3_model_path ("scaler.py");
+  const gchar *model_files[] = { model_file, NULL };
+  GstTensorFilterProperties prop;
+  GstTensorsInfo in_info, out_info;
+  guint failed = 0;
+  Py_ssize_t before, after;
+  const GstTensorFilterFramework *sp = nnstreamer_filter_find ("python3");
+
+  ASSERT_NE (sp, nullptr);
+  _SetFilterProp (&prop, "python3", model_files);
+  ASSERT_EQ (sp->open (&prop, &data), 0);
+
+  gst_tensors_info_init (&in_info);
+  in_info.num_tensors = 1;
+  in_info.info[0].type = _NNS_UINT8;
+  gst_tensor_parse_dimension ("3:4:4:1", in_info.info[0].dimension);
+
+  for (guint i = 0; i < 10; i++) {
+    sp->getModelInfo (sp, &prop, data, SET_INPUT_INFO, &in_info, &out_info);
+    gst_tensors_info_free (&out_info);
+  }
+
+  before = py_test_gc_object_count ();
+  ASSERT_GT (before, 0);
+  for (guint i = 0; i < 300; i++) {
+    if (sp->getModelInfo (sp, &prop, data, SET_INPUT_INFO, &in_info, &out_info) != 0
+        || !gst_tensor_dimension_is_equal (
+            in_info.info[0].dimension, out_info.info[0].dimension))
+      failed++;
+    gst_tensors_info_free (&out_info);
+  }
+  after = py_test_gc_object_count ();
+
+  EXPECT_EQ (failed, 0U);
+  EXPECT_LE (after - before, PY_TEST_GC_SLACK);
+
+  sp->close (&prop, &data);
+  gst_tensors_info_free (&in_info);
+  g_free (model_file);
+}
+
+/**
+ * @brief Arguments of an invoking thread
+ * @note refs_held and refs_given_back hold the reference count of the array the script module
+ *       keeps, taken around the first round while its output is still out.
+ */
+typedef struct {
+  const GstTensorFilterFramework *sp;
+  GstTensorFilterProperties prop;
+  const gchar *model_files[2];
+  void *data;
+  guint seed;
+  guint rounds;
+  guint mismatch;
+  Py_ssize_t refs_held;
+  Py_ssize_t refs_given_back;
+} FilterThreadData;
+
+/**
+ * @brief Invoke in a thread of its own the instance it was given, checking and releasing each output.
+ * @note The instance runs the kept case, so its first output is the array the script module holds.
+ */
+static gpointer
+_python3_invoke_thread (gpointer user_data)
+{
+  FilterThreadData *td = (FilterThreadData *) user_data;
+
+  for (guint i = 0; i < td->rounds; i++) {
+    const guint8 kept[4] = { 0, 1, 2, 3 };
+    guint8 in_data[8];
+    GstTensorMemory input, output[2];
+    GstTensorFilterFrameworkEventData event;
+
+    for (guint k = 0; k < sizeof (in_data); k++)
+      in_data[k] = (guint8) (td->seed + i + k);
+    input.data = in_data;
+    input.size = sizeof (in_data);
+    for (guint k = 0; k < 2; k++) {
+      output[k].data = NULL;
+      output[k].size = 4;
+    }
+
+    if (td->sp->invoke (td->sp, &td->prop, td->data, &input, output) != 0) {
+      td->mismatch++;
+      continue;
+    }
+    if (memcmp (output[0].data, kept, sizeof (kept)) != 0
+        || memcmp (output[1].data, in_data + 4, 4) != 0)
+      td->mismatch++;
+    if (td->refs_held < 0)
+      td->refs_held = py_test_attr_refcount ("filter_output_cases", "KEPT");
+    for (guint k = 0; k < 2; k++) {
+      event.data = output[k].data;
+      td->sp->eventHandler (td->sp, &td->prop, td->data, DESTROY_NOTIFY, &event);
+    }
+    if (td->refs_given_back < 0)
+      td->refs_given_back = py_test_attr_refcount ("filter_output_cases", "KEPT");
+  }
+
+  return NULL;
+}
+
+/**
+ * @brief Filters invoked in threads of their own give correct outputs and release them.
+ */
+TEST (nnstreamerFilterPython3, invokeMultiThreadKeepsObjects)
+{
+  FilterThreadData td[4];
+  GThread *threads[4];
+  gchar *model_file = _python3_model_path ("filter_output_cases.py");
+  Py_ssize_t before, after, refs_before, refs_after;
+  const GstTensorFilterFramework *sp = nnstreamer_filter_find ("python3");
+
+  ASSERT_NE (sp, nullptr);
+  for (guint t = 0; t < 4; t++) {
+    td[t].sp = sp;
+    td[t].model_files[0] = model_file;
+    td[t].model_files[1] = NULL;
+    td[t].data = NULL;
+    td[t].seed = t * 40;
+    td[t].mismatch = 0;
+    _SetFilterProp (&td[t].prop, "python3", td[t].model_files);
+    td[t].prop.custom_properties = "kept";
+    gst_tensors_info_init (&td[t].prop.input_meta);
+    td[t].prop.input_meta.num_tensors = 1;
+    td[t].prop.input_meta.info[0].type = _NNS_UINT8;
+    gst_tensor_parse_dimension ("8", td[t].prop.input_meta.info[0].dimension);
+    gst_tensors_info_init (&td[t].prop.output_meta);
+    td[t].prop.output_meta.num_tensors = 2;
+    for (guint k = 0; k < 2; k++) {
+      td[t].prop.output_meta.info[k].type = _NNS_UINT8;
+      gst_tensor_parse_dimension ("4", td[t].prop.output_meta.info[k].dimension);
+    }
+    ASSERT_EQ (sp->open (&td[t].prop, &td[t].data), 0);
+    /* warm up the lazy imports of the first invoke outside the measured window */
+    td[t].rounds = 10;
+    td[t].refs_held = td[t].refs_given_back = -1;
+    _python3_invoke_thread (&td[t]);
+    /* the filter has to take a reference on the array rather than copy it */
+    ASSERT_EQ (td[t].refs_held, td[t].refs_given_back + 1);
+    td[t].rounds = 300;
+  }
+
+  before = py_test_gc_object_count ();
+  refs_before = py_test_attr_refcount ("filter_output_cases", "KEPT");
+  ASSERT_GT (before, 0);
+  ASSERT_GT (refs_before, 0);
+  for (guint t = 0; t < 4; t++)
+    threads[t] = g_thread_new ("invoke", _python3_invoke_thread, &td[t]);
+  for (guint t = 0; t < 4; t++)
+    g_thread_join (threads[t]);
+  after = py_test_gc_object_count ();
+  refs_after = py_test_attr_refcount ("filter_output_cases", "KEPT");
+
+  for (guint t = 0; t < 4; t++) {
+    EXPECT_EQ (td[t].mismatch, 0U);
+    sp->close (&td[t].prop, &td[t].data);
+    gst_tensors_info_free (&td[t].prop.input_meta);
+    gst_tensors_info_free (&td[t].prop.output_meta);
+  }
+  EXPECT_LE (after - before, PY_TEST_GC_SLACK);
+  EXPECT_EQ (refs_after, refs_before);
+  g_free (model_file);
+}
+
+/**
+ * @brief Opening the filter again does not grow sys.path.
+ */
+TEST (nnstreamerFilterPython3, reopenKeepsSysPath)
+{
+  void *data = NULL;
+  gchar *model_file = _python3_model_path ("passthrough.py");
+  const gchar *model_files[] = { model_file, NULL };
+  GstTensorFilterProperties prop;
+  Py_ssize_t first, last = -1;
+  const GstTensorFilterFramework *sp = nnstreamer_filter_find ("python3");
+
+  ASSERT_NE (sp, nullptr);
+  _SetFilterProp (&prop, "python3", model_files);
+  ASSERT_EQ (sp->open (&prop, &data), 0);
+  sp->close (&prop, &data);
+  first = py_test_sys_path_length ();
+  ASSERT_GT (first, 0);
+
+  for (guint i = 0; i < 20; i++) {
+    ASSERT_EQ (sp->open (&prop, &data), 0);
+    sp->close (&prop, &data);
+    last = py_test_sys_path_length ();
+  }
+
+  EXPECT_EQ (last, first);
+  g_free (model_file);
+}
+
+/**
+ * @brief A script that fails to load neither opens the filter nor grows sys.path.
+ */
+TEST (nnstreamerFilterPython3, openInvalidScriptKeepsSysPath_n)
+{
+  void *data = NULL;
+  gchar *model_file = _python3_model_path ("NOT_EXIST_filter.py");
+  const gchar *model_files[] = { model_file, NULL };
+  GstTensorFilterProperties prop;
+  Py_ssize_t first = -1, last = -1;
+  const GstTensorFilterFramework *sp = nnstreamer_filter_find ("python3");
+
+  ASSERT_NE (sp, nullptr);
+  _SetFilterProp (&prop, "python3", model_files);
+  for (guint i = 0; i < 10; i++) {
+    EXPECT_NE (sp->open (&prop, &data), 0);
+    EXPECT_EQ (data, nullptr);
+    if (i == 0)
+      first = py_test_sys_path_length ();
+    last = py_test_sys_path_length ();
+  }
+
+  EXPECT_GT (first, 0);
+  EXPECT_EQ (last, first);
+  g_free (model_file);
 }
 
 /**

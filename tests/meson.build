@@ -75,12 +75,22 @@ if gtest_dep.found()
   # Run unittest_common
   unittest_common = executable('unittest_common',
     join_paths('common', 'unittest_common.cc'),
-    dependencies: [nnstreamer_unittest_deps],
+    dependencies: [nnstreamer_unittest_deps, libdl_dep],
     install: get_option('install-test'),
     install_dir: unittest_install_dir
   )
 
   test('unittest_common', unittest_common, env: testenv)
+
+  # Run unittest_subplugin
+  unittest_subplugin = executable('unittest_subplugin',
+    join_paths('nnstreamer_subplugin', 'unittest_subplugin.cc'),
+    dependencies: [nnstreamer_unittest_deps],
+    install: get_option('install-test'),
+    install_dir: unittest_install_dir
+  )
+
+  test('unittest_subplugin', unittest_subplugin, env: testenv)
 
   # Run unittest_sink
   gst18_dep = dependency('gstreamer-' + gst_api_version, version : '>=1.8', required : false)
@@ -112,6 +122,51 @@ if gtest_dep.found()
     )
     test('unittest_decoder_boundingbox', unittest_decoder_boundingbox, env: testenv)
 
+    # RUN unittest_decoder_pose
+    unittest_decoder_pose = executable('unittest_decoder_pose',
+      join_paths('nnstreamer_decoder_pose', 'unittest_decoder_pose.cc'),
+      dependencies: [nnstreamer_unittest_deps, nnstreamer_internal_deps],
+      install: get_option('install-test'),
+      install_dir: unittest_install_dir
+    )
+    test('unittest_decoder_pose', unittest_decoder_pose, env: testenv)
+
+    # RUN unittest_decoder_direct_video
+    unittest_decoder_direct_video = executable('unittest_decoder_direct_video',
+      join_paths('nnstreamer_decoder', 'unittest_decoder_direct_video.cc'),
+      dependencies: [nnstreamer_unittest_deps],
+      install: get_option('install-test'),
+      install_dir: unittest_install_dir
+    )
+    test('unittest_decoder_direct_video', unittest_decoder_direct_video, env: testenv)
+
+    # RUN unittest_decoder_image_segment
+    unittest_decoder_image_segment = executable('unittest_decoder_image_segment',
+      join_paths('nnstreamer_decoder_image_segment', 'unittest_decoder_image_segment.cc'),
+      dependencies: [nnstreamer_unittest_deps, nnstreamer_internal_deps],
+      install: get_option('install-test'),
+      install_dir: unittest_install_dir
+    )
+    test('unittest_decoder_image_segment', unittest_decoder_image_segment, env: testenv)
+
+    # RUN unittest_decoder_plugin_data
+    unittest_decoder_plugin_data = executable('unittest_decoder_plugin_data',
+      join_paths('nnstreamer_decoder', 'unittest_decoder_plugin_data.cc'),
+      dependencies: [nnstreamer_unittest_deps],
+      install: get_option('install-test'),
+      install_dir: unittest_install_dir
+    )
+    test('unittest_decoder_plugin_data', unittest_decoder_plugin_data, timeout: 120, env: testenv)
+
+    # RUN unittest_decoder_octet_stream
+    unittest_decoder_octet_stream = executable('unittest_decoder_octet_stream',
+      join_paths('nnstreamer_decoder', 'unittest_decoder_octet_stream.cc'),
+      dependencies: [nnstreamer_unittest_deps],
+      install: get_option('install-test'),
+      install_dir: unittest_install_dir
+    )
+    test('unittest_decoder_octet_stream', unittest_decoder_octet_stream, env: testenv)
+
     # Run unittest_plugins
     unittest_plugins = executable('unittest_plugins',
       join_paths('nnstreamer_plugins', 'unittest_plugins.cc'),
@@ -120,12 +175,22 @@ if gtest_dep.found()
       install_dir: unittest_install_dir
     )
 
-    test('unittest_plugins', unittest_plugins, env: testenv)
+    test('unittest_plugins', unittest_plugins, timeout: 120, env: testenv)
+
+    # Run unittest_sparse
+    unittest_sparse = executable('unittest_sparse',
+      join_paths('nnstreamer_sparse', 'unittest_sparse.cc'),
+      dependencies: [nnstreamer_unittest_deps, nnstreamer_internal_deps],
+      install: get_option('install-test'),
+      install_dir: unittest_install_dir
+    )
+
+    test('unittest_sparse', unittest_sparse, env: testenv)
 
     # Run unittest_watchdog
     unittest_watchdog = executable('unittest_watchdog',
       join_paths('nnstreamer_watchdog', 'unittest_watchdog.cc'),
-      dependencies: [nnstreamer_unittest_deps],
+      dependencies: [nnstreamer_unittest_deps, libdl_dep],
       install: get_option('install-test'),
       install_dir: unittest_install_dir
     )
@@ -141,6 +206,56 @@ if gtest_dep.found()
     )
 
     test('unittest_if', unittest_if, env: testenv)
+
+    # Run unittest_aggregator
+    unittest_aggregator = executable('unittest_aggregator',
+      join_paths('nnstreamer_aggregator', 'unittest_aggregator.cc'),
+      dependencies: [nnstreamer_unittest_deps],
+      install: get_option('install-test'),
+      install_dir: unittest_install_dir
+    )
+
+    test('unittest_aggregator', unittest_aggregator, env: testenv)
+
+    # Run unittest_demux
+    unittest_demux = executable('unittest_demux',
+      join_paths('nnstreamer_demux', 'unittest_demux.cc'),
+      dependencies: [nnstreamer_unittest_deps],
+      install: get_option('install-test'),
+      install_dir: unittest_install_dir
+    )
+
+    test('unittest_demux', unittest_demux, env: testenv)
+
+    # Run unittest_merge
+    unittest_merge = executable('unittest_merge',
+      join_paths('nnstreamer_merge', 'unittest_merge.cc'),
+      dependencies: [nnstreamer_unittest_deps],
+      install: get_option('install-test'),
+      install_dir: unittest_install_dir
+    )
+
+    test('unittest_merge', unittest_merge, timeout: 240, env: testenv)
+
+    # Run unittest_mux
+    unittest_mux = executable('unittest_mux',
+      join_paths('nnstreamer_mux', 'unittest_mux.cc'),
+      dependencies: [nnstreamer_unittest_deps],
+      install: get_option('install-test'),
+      install_dir: unittest_install_dir
+    )
+
+    test('unittest_mux', unittest_mux, env: testenv)
+
+    # Run unittest_repo
+    unittest_repo = executable('unittest_repo',
+      join_paths('nnstreamer_repo', 'unittest_repo.cc'),
+      dependencies: [nnstreamer_unittest_deps],
+      install: get_option('install-test'),
+      install_dir: unittest_install_dir
+    )
+
+    test('unittest_repo', unittest_repo, timeout: 60, env: testenv)
 
     # Run unittest_rate
     unittest_rate = executable('unittest_rate',
@@ -161,6 +276,26 @@ if gtest_dep.found()
     )
 
     test('unittest_latency', unittest_latency, env: testenv)
+
+    # Run unittest_filter_event
+    unittest_filter_event = executable('unittest_filter_event',
+      join_paths('nnstreamer_filter_event', 'unittest_filter_event.cc'),
+      dependencies: [nnstreamer_unittest_deps],
+      install: get_option('install-test'),
+      install_dir: unittest_install_dir
+    )
+
+    test('unittest_filter_event', unittest_filter_event, env: testenv)
+
+    # Run unittest_filter_common
+    unittest_filter_common = executable('unittest_filter_common',
+      join_paths('nnstreamer_filter_common', 'unittest_filter_common.cc'),
+      dependencies: [nnstreamer_unittest_deps],
+      install: get_option('install-test'),
+      install_dir: unittest_install_dir
+    )
+
+    test('unittest_filter_common', unittest_filter_common, env: testenv)
 
     # Run unittest_filter_single
     unittest_filter_single = executable('unittest_filter_single',
@@ -192,7 +327,15 @@ if gtest_dep.found()
           install: get_option('install-test'),
           install_dir: unittest_install_dir)
 
-      test('unittest_mqtt_w_helper', unittest_mqtt_w_helper, env: testenv)
+      test('unittest_mqtt_w_helper', unittest_mqtt_w_helper, timeout: 180, env: testenv)
+
+      unittest_mqtt_src = executable('unittest_mqtt_src',
+          join_paths('gstreamer_mqtt', 'unittest_mqtt_src.cc'),
+          dependencies: [gstmqtt_dep, nnstreamer_unittest_deps],
+          install: get_option('install-test'),
+          install_dir: unittest_install_dir)
+
+      test('unittest_mqtt_src', unittest_mqtt_src, timeout: 120, env: testenv)
 
       unittest_mqtt = executable('unittest_mqtt',
           join_paths('gstreamer_mqtt', 'unittest_mqtt.cc'),
@@ -248,9 +391,18 @@ if gtest_dep.found()
 
     test('unittest_converter_timestamp', unittest_converter_timestamp, timeout: 120, env: testenv)
 
+    unittest_converter_config = executable('unittest_converter_config',
+      join_paths('nnstreamer_converter', 'unittest_converter_config.cc'),
+      dependencies: [nnstreamer_unittest_deps],
+      install: get_option('install-test'),
+      install_dir: unittest_install_dir
+    )
+
+    test('unittest_converter_config', unittest_converter_config, env: testenv)
+
     unittest_filter_custom = executable('unittest_filter_custom',
       join_paths('nnstreamer_filter_custom', 'unittest_filter_custom.cc'),
-      dependencies: [nnstreamer_unittest_deps],
+      dependencies: [nnstreamer_unittest_deps, libdl_dep],
       install: get_option('install-test'),
       install_dir: unittest_install_dir
     )
@@ -294,11 +446,74 @@ if gtest_dep.found()
     test('unittest_filter_snpe', unittest_filter_snpe, env: testenv)
   endif
 
+  # SNPE sub-plugin unit tests on a mock of the SNPE SDK. The two sub-plugin
+  # sources need the proprietary SDK, which no CI job has, so they are built
+  # here against tests/nnstreamer_filter_snpe/mock instead and exercised by the
+  # cases of unittest_filter_snpe.cc plus the error paths of the mock tests.
+  # They are not installed: the .dlc files they read are installed only when
+  # tensor_filter_ext_enabled holds, which no SNPE build implies.
+  snpe_mock_dir = join_paths('nnstreamer_filter_snpe', 'mock')
+  snpe_subplugin_dir = join_paths('..', 'ext', 'nnstreamer', 'tensor_filter')
+  snpe_mock_common_sources = [
+    join_paths(snpe_mock_dir, 'snpe_mock_common.cc'),
+    join_paths('nnstreamer_filter_snpe', 'unittest_filter_snpe.cc')
+  ]
+
+  # The mock ledger tells a leaked GLib string from a released one by
+  # interposing the allocators the sub-plugins use, which needs the GNU linker.
+  snpe_mock_wrap_args = []
+  foreach snpe_wrapped_symbol : ['g_strsplit', 'g_strjoinv', 'g_strdup', 'g_strfreev', 'g_free', 'gst_tensors_info_free']
+    snpe_mock_wrap_args += '-Wl,--wrap=' + snpe_wrapped_symbol
+  endforeach
+  snpe_mock_ledger_args = []
+  if host_machine.system() != 'linux' or not cxx.has_multi_link_arguments(snpe_mock_wrap_args)
+    snpe_mock_wrap_args = []
+  else
+    snpe_mock_ledger_args = ['-DSNPE_MOCK_LEDGER=1']
+  endif
+
+  unittest_filter_snpe_mock_v2 = executable('unittest_filter_snpe_mock_v2',
+    snpe_mock_common_sources + [
+      join_paths(snpe_mock_dir, 'snpe_mock_v2.cc'),
+      join_paths('nnstreamer_filter_snpe', 'unittest_filter_snpe_mock_v2.cc'),
+      join_paths(snpe_subplugin_dir, 'tensor_filter_snpe.cc')
+    ],
+    dependencies: [nnstreamer_unittest_deps, nnstreamer_single_dep],
+    include_directories: include_directories(join_paths(snpe_mock_dir, 'v2')),
+    cpp_args: ['-USNPE_VERSION_MAJOR', '-DSNPE_VERSION_MAJOR=2'] + snpe_mock_ledger_args,
+    link_args: snpe_mock_wrap_args,
+    install: false
+  )
+
+  test('unittest_filter_snpe_mock_v2', unittest_filter_snpe_mock_v2, env: testenv)
+
+  unittest_filter_snpe_mock_v1 = executable('unittest_filter_snpe_mock_v1',
+    snpe_mock_common_sources + [
+      join_paths(snpe_mock_dir, 'snpe_mock_v1.cc'),
+      join_paths('nnstreamer_filter_snpe', 'unittest_filter_snpe_mock_v1.cc'),
+      join_paths(snpe_subplugin_dir, 'tensor_filter_snpe_v1.cc')
+    ],
+    dependencies: [nnstreamer_unittest_deps, nnstreamer_single_dep],
+    include_directories: include_directories(join_paths(snpe_mock_dir, 'v1')),
+    cpp_args: ['-USNPE_VERSION_MAJOR', '-DSNPE_VERSION_MAJOR=1'] + snpe_mock_ledger_args,
+    link_args: snpe_mock_wrap_args,
+    install: false
+  )
+
+  test('unittest_filter_snpe_mock_v1', unittest_filter_snpe_mock_v1, env: testenv)
+
   # tensorflow2-lite unittest
   if tflite2_support_is_available
+    shared_library('nnstreamer_unittest_tflite_lifetime_delegate',
+      join_paths('nnstreamer_filter_tensorflow2_lite', 'tflite_lifetime_delegate.cc'),
+      dependencies: [tflite2_support_deps, tflite2_extra_dep],
+      install: get_option('install-test'),
+      install_dir: unittest_install_dir
+    )
+
     unittest_filter_tensorflow2_lite = executable('unittest_filter_tensorflow2_lite',
       join_paths('nnstreamer_filter_tensorflow2_lite', 'unittest_filter_tensorflow2_lite.cc'),
-      dependencies: [nnstreamer_unittest_deps],
+      dependencies: [nnstreamer_unittest_deps, libdl_dep, tflite2_extra_dep],
       install: get_option('install-test'),
       install_dir: unittest_install_dir
     )
@@ -316,6 +531,15 @@ if gtest_dep.found()
     )
 
     test('unittest_filter_python3', unittest_filter_python3, env: testenv)
+
+    unittest_decoder_python3 = executable('unittest_decoder_python3',
+      join_paths('nnstreamer_decoder_python3', 'unittest_decoder_python3.cc'),
+      dependencies: [nnstreamer_unittest_deps, python3_dep],
+      install: get_option('install-test'),
+      install_dir: unittest_install_dir
+    )
+
+    test('unittest_decoder_python3', unittest_decoder_python3, env: testenv)
   endif
 
   # Run unittest_decoder
@@ -330,11 +554,49 @@ if gtest_dep.found()
     test('unittest_decoder', unittest_decoder, env: testenv)
   endif
 
+  # Run unittest_converter_serialized
+  if flatbuf_support_is_available or protobuf_support_is_available
+    converter_serialized_deps = [nnstreamer_unittest_deps, nnstreamer_internal_deps]
+    if flatbuf_support_is_available
+      converter_serialized_deps += flatbuf_util_dep
+    endif
+    if protobuf_support_is_available
+      converter_serialized_deps += protobuf_util_dep
+    endif
+
+    unittest_converter_serialized = executable('unittest_converter_serialized',
+      join_paths('nnstreamer_converter_serialized', 'unittest_converter_serialized.cc'),
+      dependencies: converter_serialized_deps,
+      install: get_option('install-test'),
+      install_dir: unittest_install_dir
+    )
+
+    test('unittest_converter_serialized', unittest_converter_serialized, env: testenv)
+  endif
+
   # gRPC unittest
   if grpc_support_is_available
+    unittest_grpc_src = [join_paths('nnstreamer_grpc', 'unittest_grpc.cc')]
+    unittest_grpc_deps = [nnstreamer_unittest_deps, gmodule_dep]
+    if protobuf_support_is_available
+      unittest_grpc_src += grpc_pb_gen_src
+      unittest_grpc_deps += [grpc_support_deps, protobuf_util_dep]
+    endif
+    if flatbuf_support_is_available
+      unittest_grpc_src += grpc_fb_gen_src
+      unittest_grpc_deps += [grpc_support_deps, flatbuf_dep]
+    endif
+
+    # the element headers are needed to check what the elements hold
+    unittest_grpc_inc = include_directories(
+      join_paths('..', 'ext', 'nnstreamer', 'extra'),
+      join_paths('..', 'ext', 'nnstreamer', 'tensor_sink'),
+      join_paths('..', 'ext', 'nnstreamer', 'tensor_source'))
+
     unittest_grpc = executable('unittest_grpc',
-      join_paths('nnstreamer_grpc', 'unittest_grpc.cc'),
-      dependencies: nnstreamer_unittest_deps,
+      unittest_grpc_src,
+      include_directories: unittest_grpc_inc,
+      dependencies: unittest_grpc_deps,
       install: get_option('install-test'),
       install_dir: unittest_install_dir
     )
@@ -349,6 +611,9 @@ if gtest_dep.found()
 
   # Tensor filter extensions basic test cases
   subdir('nnstreamer_filter_extensions_common')
+
+  # Vivante sub-plugin, built against a mock of its proprietary SDK
+  subdir('nnstreamer_filter_vivante')
 
   # Tizen NNFW runtime
   if nnfw_runtime_support_is_available

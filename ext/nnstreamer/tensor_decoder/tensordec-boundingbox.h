@@ -47,7 +47,7 @@
  *            An example of option3 is "option3=0:0.65:0.6"
  *          for mobilenet-ssd mode:
  *            The option3 definition scheme is, in order, the following:
- *                - box priors location file (mandatory)
+ *                - box priors location file (mandatory), with a prior for every detection
  *                - Detection threshold (optional, default set to 0.5)
  *                - Y box scale (optional, default set to 10.0)
  *                - X box scale (optional, default set to 10.0)
@@ -75,12 +75,14 @@
  *          for mp-palm-detection mode:
  *            The option3 is required to have 5 float numbers, as following
  *                - box score threshold (mandatory)
- *                - number of layers for anchor generation (optional, default set to 4)
+ *                - number of layers for anchor generation (optional, default set to 4, at most 7)
  *                - minimum scale factor for anchor generation (optional, default set to 1.0)
  *                - maximum scale factor for anchor generation (optional, default set to 1.0)
  *                - X offset (optional, default set to 0.5)
  *                - Y offset (optional, default set to 0.5)
  *                - strides for each layer for anchor generation (optional, default set to 8:16:16:16)
+ *            A layer beyond the fourth needs its stride given, and a stride has to be positive.
+ *            The anchors generated have to be at least as many as the detections of the model.
  *            The default parameter value could be set in the following ways:
  *            option3=0.5
  *            option3=0.5:4:0.2:0.8
@@ -273,7 +275,6 @@ class BoxProperties
   {
     return i_height;
   }
-  gchar *name = nullptr;
 
   protected:
   guint i_width = 0; /**< Input Video Width */
@@ -282,6 +283,11 @@ class BoxProperties
   guint max_detection = 0;
   guint total_labels = 0;
 };
+
+/**
+ * @brief Function that creates a new instance of the box properties of a mode
+ */
+typedef BoxProperties *(*BoxPropertiesCreator) (void);
 
 /**
  * @brief	Class for Bounding box tensor decoder
@@ -318,14 +324,15 @@ class BoundingBox
   GstFlowReturn decode (const GstTensorsConfig *config,
       const GstTensorMemory *input, GstBuffer *outbuf);
 
-  /** @brief Look up registered box properties by mode name */
-  static BoxProperties *getProperties (const gchar *properties_name);
-  /** @brief Register box properties into the mode name table */
-  static gboolean addProperties (BoxProperties *boxProperties);
+  /** @brief Create a new instance of the box properties registered under a mode name */
+  static BoxProperties *createProperties (const gchar *properties_name);
+  /** @brief Register the creator of box properties under a mode name */
+  static gboolean addProperties (const gchar *properties_name, BoxPropertiesCreator creator);
 
   private:
   bounding_box_modes mode;
-  BoxProperties *bdata;
+  BoxProperties *bdata; /**< The box properties of the mode option1 selected */
+  GHashTable *properties; /**< The box properties of every mode selected, kept until exit */
 
   /* From option2 */
   imglabel_t labeldata;
@@ -349,7 +356,7 @@ class BoundingBox
 
   gboolean flag_use_label;
 
-  /* Table for box properties data */
+  /* Table for the creators of box properties, by mode name */
   inline static GHashTable *properties_table;
 };
 #endif /* _TENSORDECBB_H__ */

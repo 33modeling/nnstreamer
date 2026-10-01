@@ -21,6 +21,7 @@
 #include <nnstreamer_subplugin.h>
 #include <nnstreamer_util.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <tensor_common.h>
 #include <tensor_decoder_custom.h>
 #include <tensor_meta.h>
@@ -1880,6 +1881,1365 @@ _push_tensor_of_size (GstHarness *h, gsize size)
 }
 
 /**
+ * @brief Data for the thread changing the properties of tensor_transform
+ */
+typedef struct {
+  GstElement *element; /**< tensor_transform to be changed */
+  gint stop; /**< set to stop the thread */
+  guint changes; /**< number of times the properties were changed */
+} transform_prop_changer_s;
+
+/**
+ * @brief Thread function toggling the option and apply of tensor_transform
+ */
+static gpointer
+_toggle_transform_props (gpointer user_data)
+{
+  transform_prop_changer_s *data = (transform_prop_changer_s *) user_data;
+  gchar *option;
+
+  while (!g_atomic_int_get (&data->stop)) {
+    g_object_set (data->element, "option", (data->changes % 2) ? "add:2" : "add:1", NULL);
+    /* both select the only tensor, the list is still freed and rebuilt */
+    g_object_set (data->element, "apply", (data->changes % 2) ? "0" : "", NULL);
+    g_object_get (data->element, "option", &option, NULL);
+    g_free (option);
+
+    data->changes++;
+    g_thread_yield ();
+  }
+
+  return NULL;
+}
+
+/**
+ * @brief Test for changing option and apply from another thread while
+ *        buffers are transformed (#4932). Every buffer must be transformed by
+ *        exactly one of the operators, never by a released or empty list.
+ */
+TEST (testTensorTransform, optionChangeFromAnotherThread)
+{
+  const guint num_buffers = 500U;
+  const guint array_size = 1024U;
+  transform_prop_changer_s data;
+  GstHarness *h;
+  GstTensorsConfig config;
+  GstBuffer *in_buf, *out_buf;
+  GstMemory *mem;
+  GstMapInfo info;
+  GThread *thread;
+  guint i, b, mismatched = 0;
+
+  h = gst_harness_new ("tensor_transform");
+  ASSERT_TRUE (NULL != h);
+
+  g_object_set (h->element, "mode", GTT_ARITHMETIC, "option", "add:1", NULL);
+
+  gst_tensors_config_init (&config);
+  config.info.num_tensors = 1U;
+  config.info.info[0].type = _NNS_UINT8;
+  gst_tensor_parse_dimension ("1024", config.info.info[0].dimension);
+  config.rate_n = 0;
+  config.rate_d = 1;
+
+  gst_harness_set_src_caps (h, gst_tensors_caps_from_config (&config));
+
+  data.element = h->element;
+  data.stop = 0;
+  data.changes = 0;
+  thread = g_thread_new ("transform-props", _toggle_transform_props, &data);
+
+  for (b = 0; b < num_buffers && mismatched == 0; b++) {
+    guint8 delta;
+
+    in_buf = gst_harness_create_buffer (h, array_size);
+    mem = gst_buffer_peek_memory (in_buf, 0);
+    if (!gst_memory_map (mem, &info, GST_MAP_WRITE)) {
+      gst_buffer_unref (in_buf);
+      mismatched++;
+      break;
+    }
+    for (i = 0; i < array_size; i++)
+      info.data[i] = i % 100;
+    gst_memory_unmap (mem, &info);
+
+    EXPECT_EQ (gst_harness_push (h, in_buf), GST_FLOW_OK);
+    out_buf = gst_harness_try_pull (h);
+    if (out_buf == NULL) {
+      mismatched++;
+      break;
+    }
+
+    mem = gst_buffer_peek_memory (out_buf, 0);
+    if (!gst_memory_map (mem, &info, GST_MAP_READ)) {
+      gst_buffer_unref (out_buf);
+      mismatched++;
+      break;
+    }
+
+    delta = info.data[0];
+    if (info.size != array_size || (delta != 1 && delta != 2))
+      mismatched++;
+    for (i = 1; i < info.size && mismatched == 0; i++) {
+      if (info.data[i] != (guint8) (i % 100 + delta))
+        mismatched++;
+    }
+
+    gst_memory_unmap (mem, &info);
+    gst_buffer_unref (out_buf);
+  }
+
+  g_atomic_int_set (&data.stop, 1);
+  g_thread_join (thread);
+
+  EXPECT_EQ (mismatched, 0U);
+  EXPECT_EQ (b, num_buffers);
+  EXPECT_GT (data.changes, 0U);
+
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Data for the bus sync handler of tensor_transform
+ */
+typedef struct {
+  GstTensorTransform *transform; /**< tensor_transform posting the error */
+  gboolean error_posted; /**< TRUE if an error message was posted */
+  gboolean locked_on_post; /**< TRUE if the element was locked while posting */
+  gchar *option; /**< option read from the sync handler */
+} transform_bus_data_s;
+
+/**
+ * @brief Bus sync handler reading the option of tensor_transform on an error
+ */
+static GstBusSyncReply
+_transform_error_sync_handler (GstBus *bus, GstMessage *msg, gpointer user_data)
+{
+  transform_bus_data_s *data = (transform_bus_data_s *) user_data;
+
+  UNUSED (bus);
+
+  if (GST_MESSAGE_TYPE (msg) == GST_MESSAGE_ERROR) {
+    data->error_posted = TRUE;
+
+    /* reading the property would deadlock if the error is posted locked */
+    if (g_mutex_trylock (&data->transform->lock)) {
+      g_mutex_unlock (&data->transform->lock);
+      g_free (data->option);
+      g_object_get (data->transform, "option", &data->option, NULL);
+    } else {
+      data->locked_on_post = TRUE;
+    }
+  }
+
+  /* a handler returning GST_BUS_DROP owns the message */
+  gst_message_unref (msg);
+  return GST_BUS_DROP;
+}
+
+/**
+ * @brief Test for a mode change that leaves the element unconfigured while
+ *        streaming (#4932). The error is posted without holding the lock, so
+ *        a bus sync handler can read the properties.
+ */
+TEST (testTensorTransform, notConfiguredWhileStreaming_n)
+{
+  transform_bus_data_s data = { NULL, FALSE, FALSE, NULL };
+  GstHarness *h;
+  GstTensorsConfig config;
+  GstBus *bus;
+
+  h = gst_harness_new ("tensor_transform");
+  ASSERT_TRUE (NULL != h);
+
+  g_object_set (h->element, "mode", GTT_ARITHMETIC, "option", "add:1", NULL);
+
+  bus = gst_bus_new ();
+  data.transform = GST_TENSOR_TRANSFORM (h->element);
+  gst_bus_set_sync_handler (bus, _transform_error_sync_handler, &data, NULL);
+  gst_element_set_bus (h->element, bus);
+
+  gst_tensors_config_init (&config);
+  config.info.num_tensors = 1U;
+  config.info.info[0].type = _NNS_UINT8;
+  gst_tensor_parse_dimension ("5", config.info.info[0].dimension);
+  config.rate_n = 0;
+  config.rate_d = 1;
+
+  gst_harness_set_src_caps (h, gst_tensors_caps_from_config (&config));
+  EXPECT_EQ (_push_tensor_of_size (h, 5), GST_FLOW_OK);
+  EXPECT_FALSE (data.error_posted);
+
+  /* "add:1" is not a valid dimchg option: the element is unconfigured again */
+  g_object_set (h->element, "mode", GTT_DIMCHG, NULL);
+  EXPECT_EQ (_push_tensor_of_size (h, 5), GST_FLOW_ERROR);
+
+  EXPECT_TRUE (data.error_posted);
+  EXPECT_FALSE (data.locked_on_post);
+  EXPECT_STREQ (data.option, "add:1");
+
+  gst_harness_teardown (h);
+  gst_bus_set_flushing (bus, TRUE);
+  gst_object_unref (bus);
+  g_free (data.option);
+}
+
+/**
+ * @brief Create a uint8 buffer of the given size filled with 1, 2, 3, ...
+ */
+static GstBuffer *
+_new_uint8_sequence (GstHarness *h, gsize size)
+{
+  GstBuffer *buf = gst_harness_create_buffer (h, size);
+  GstMemory *mem = gst_buffer_peek_memory (buf, 0);
+  GstMapInfo info;
+  gsize i;
+
+  if (gst_memory_map (mem, &info, GST_MAP_WRITE)) {
+    for (i = 0; i < info.size; i++)
+      info.data[i] = (guint8) (i + 1);
+    gst_memory_unmap (mem, &info);
+  }
+
+  return buf;
+}
+
+/**
+ * @brief Get the tensors config of the caps the harness sink pad received
+ */
+static gboolean
+_get_harness_sink_config (GstHarness *h, GstTensorsConfig *config)
+{
+  GstCaps *caps = gst_pad_get_current_caps (h->sinkpad);
+  gboolean ret = FALSE;
+
+  gst_tensors_config_init (config);
+  if (caps) {
+    ret = gst_tensors_config_from_caps (config, caps, TRUE);
+    gst_caps_unref (caps);
+  }
+
+  return ret;
+}
+
+/**
+ * @brief Check a padded tensor of the input made by _new_uint8_sequence()
+ * @param mem memory holding the padded tensor from the given offset
+ */
+static void
+_check_padded_uint8 (GstMemory *mem, gsize offset, guint width, guint height,
+    guint left, guint right, guint top, guint bottom)
+{
+  const gsize out_w = (gsize) width + left + right;
+  const gsize out_h = (gsize) height + top + bottom;
+  GstMapInfo info;
+  gsize x, y;
+  guint mismatched = 0;
+  guint8 expected;
+
+  ASSERT_TRUE (gst_memory_map (mem, &info, GST_MAP_READ));
+  EXPECT_EQ (info.size, offset + out_w * out_h);
+
+  if (info.size == offset + out_w * out_h) {
+    for (y = 0; y < out_h; y++) {
+      for (x = 0; x < out_w; x++) {
+        expected = 0;
+        if (x >= left && x < left + width && y >= top && y < top + height)
+          expected = (guint8) ((y - top) * width + (x - left) + 1);
+        if (info.data[offset + y * out_w + x] != expected)
+          mismatched++;
+      }
+    }
+  }
+
+  EXPECT_EQ (mismatched, 0U);
+  gst_memory_unmap (mem, &info);
+}
+
+/**
+ * @brief Test for changing the padding while streaming (#4933). The output
+ *        caps are renegotiated, so the buffer is as large as they describe.
+ */
+TEST (testTensorTransform, paddingChangeWhileStreaming)
+{
+  GstHarness *h;
+  GstTensorsConfig config, out_config;
+  GstBuffer *out_buf;
+
+  h = gst_harness_new ("tensor_transform");
+  ASSERT_TRUE (NULL != h);
+
+  g_object_set (h->element, "mode", GTT_PADDING, "option", "left:1,right:1", NULL);
+
+  gst_tensors_config_init (&config);
+  config.info.num_tensors = 1U;
+  config.info.info[0].type = _NNS_UINT8;
+  gst_tensor_parse_dimension ("4:3:1:1", config.info.info[0].dimension);
+  config.rate_n = 0;
+  config.rate_d = 1;
+
+  gst_harness_set_src_caps (h, gst_tensors_caps_from_config (&config));
+
+  EXPECT_EQ (gst_harness_push (h, _new_uint8_sequence (h, 12)), GST_FLOW_OK);
+  out_buf = gst_harness_try_pull (h);
+  ASSERT_TRUE (out_buf != NULL);
+  ASSERT_TRUE (_get_harness_sink_config (h, &out_config));
+  EXPECT_EQ (gst_buffer_get_size (out_buf),
+      gst_tensors_info_get_size (&out_config.info, 0));
+  _check_padded_uint8 (gst_buffer_peek_memory (out_buf, 0), 0, 4, 3, 1, 1, 0, 0);
+  gst_tensors_config_free (&out_config);
+  gst_buffer_unref (out_buf);
+
+  /* 9:6 instead of 6:3, the old caps would describe a third of the tensor */
+  g_object_set (h->element, "option", "left:2,right:3,top:1,bottom:2", NULL);
+
+  EXPECT_EQ (gst_harness_push (h, _new_uint8_sequence (h, 12)), GST_FLOW_OK);
+  out_buf = gst_harness_try_pull (h);
+  ASSERT_TRUE (out_buf != NULL);
+  ASSERT_TRUE (_get_harness_sink_config (h, &out_config));
+  EXPECT_EQ (out_config.info.info[0].dimension[0], 9U);
+  EXPECT_EQ (out_config.info.info[0].dimension[1], 6U);
+  EXPECT_EQ (gst_buffer_get_size (out_buf),
+      gst_tensors_info_get_size (&out_config.info, 0));
+  _check_padded_uint8 (gst_buffer_peek_memory (out_buf, 0), 0, 4, 3, 2, 3, 1, 2);
+  gst_tensors_config_free (&out_config);
+  gst_buffer_unref (out_buf);
+
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Test for changing the tensors a size-changing mode applies to while
+ *        streaming (#4933). The tensor excluded after the change keeps its
+ *        input size, and the renegotiated caps describe it that way.
+ */
+TEST (testTensorTransform, typecastApplyChangeWhileStreaming)
+{
+  const guint num_tensors = 2U;
+  const guint array_size = 8U;
+  const gchar *apply_values[] = { "0", "1" };
+  GstHarness *h;
+  GstTensorsConfig config, out_config;
+  GstBuffer *in_buf, *out_buf;
+  GstTensorInfo *_info;
+  GstMemory *mem;
+  GstMapInfo map;
+  guint i, j, p;
+
+  h = gst_harness_new ("tensor_transform");
+  ASSERT_TRUE (NULL != h);
+
+  g_object_set (h->element, "mode", GTT_TYPECAST, "option", "float32", NULL);
+  g_object_set (h->element, "acceleration", (gboolean) FALSE, NULL);
+
+  gst_tensors_config_init (&config);
+  config.info.num_tensors = num_tensors;
+  config.rate_n = 0;
+  config.rate_d = 1;
+  for (i = 0; i < num_tensors; i++) {
+    _info = gst_tensors_info_get_nth_info (&config.info, i);
+    _info->type = _NNS_UINT8;
+    gst_tensor_parse_dimension ("8", _info->dimension);
+  }
+
+  for (p = 0; p < G_N_ELEMENTS (apply_values); p++) {
+    g_object_set (h->element, "apply", apply_values[p], NULL);
+    if (p == 0)
+      gst_harness_set_src_caps (h, gst_tensors_caps_from_config (&config));
+
+    in_buf = gst_buffer_new ();
+    for (i = 0; i < num_tensors; i++) {
+      mem = gst_allocator_alloc (NULL, array_size, NULL);
+      ASSERT_TRUE (gst_memory_map (mem, &map, GST_MAP_WRITE));
+      for (j = 0; j < array_size; j++)
+        map.data[j] = (guint8) (i * 10 + j);
+      gst_memory_unmap (mem, &map);
+      gst_buffer_append_memory (in_buf, mem);
+    }
+
+    EXPECT_EQ (gst_harness_push (h, in_buf), GST_FLOW_OK);
+    out_buf = gst_harness_try_pull (h);
+    ASSERT_TRUE (out_buf != NULL);
+    ASSERT_EQ (gst_buffer_n_memory (out_buf), num_tensors);
+    ASSERT_TRUE (_get_harness_sink_config (h, &out_config));
+
+    for (i = 0; i < num_tensors; i++) {
+      _info = gst_tensors_info_get_nth_info (&out_config.info, i);
+      EXPECT_EQ (_info->type, (i == p) ? _NNS_FLOAT32 : _NNS_UINT8);
+
+      mem = gst_buffer_peek_memory (out_buf, i);
+      ASSERT_TRUE (gst_memory_map (mem, &map, GST_MAP_READ));
+      EXPECT_EQ (map.size, gst_tensor_info_get_size (_info));
+
+      if (map.size == gst_tensor_info_get_size (_info)) {
+        for (j = 0; j < array_size; j++) {
+          if (i == p)
+            EXPECT_FLOAT_EQ (((float *) map.data)[j], (float) (i * 10 + j));
+          else
+            EXPECT_EQ (map.data[j], (guint8) (i * 10 + j));
+        }
+      }
+      gst_memory_unmap (mem, &map);
+    }
+
+    gst_tensors_config_free (&out_config);
+    gst_buffer_unref (out_buf);
+  }
+
+  gst_tensors_config_free (&config);
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Test for changing the padding of a static input while the output
+ *        is flexible (#4933). The flexible caps stay the same, so each
+ *        tensor's header carries the new dimension instead.
+ */
+TEST (testTensorTransform, paddingChangeFlexibleOutput)
+{
+  GstHarness *h;
+  GstTensorsConfig config;
+  GstTensorMetaInfo meta;
+  GstBuffer *out_buf;
+  GstMemory *mem;
+  gsize hsize;
+
+  h = gst_harness_new ("tensor_transform");
+  ASSERT_TRUE (NULL != h);
+
+  g_object_set (h->element, "mode", GTT_PADDING, "option", "left:1,right:1", NULL);
+  gst_harness_set_sink_caps_str (h, GST_TENSORS_FLEX_CAP_DEFAULT);
+
+  gst_tensors_config_init (&config);
+  config.info.num_tensors = 1U;
+  config.info.info[0].type = _NNS_UINT8;
+  gst_tensor_parse_dimension ("4:3:1:1", config.info.info[0].dimension);
+  config.rate_n = 0;
+  config.rate_d = 1;
+
+  gst_harness_set_src_caps (h, gst_tensors_caps_from_config (&config));
+
+  EXPECT_EQ (gst_harness_push (h, _new_uint8_sequence (h, 12)), GST_FLOW_OK);
+  out_buf = gst_harness_try_pull (h);
+  ASSERT_TRUE (out_buf != NULL);
+  mem = gst_buffer_peek_memory (out_buf, 0);
+  ASSERT_TRUE (gst_tensor_meta_info_parse_memory (&meta, mem));
+  EXPECT_EQ (meta.dimension[0], 6U);
+  EXPECT_EQ (meta.dimension[1], 3U);
+  hsize = gst_tensor_meta_info_get_header_size (&meta);
+  _check_padded_uint8 (mem, hsize, 4, 3, 1, 1, 0, 0);
+  gst_buffer_unref (out_buf);
+
+  g_object_set (h->element, "option", "left:2,right:3,top:1,bottom:2", NULL);
+
+  EXPECT_EQ (gst_harness_push (h, _new_uint8_sequence (h, 12)), GST_FLOW_OK);
+  out_buf = gst_harness_try_pull (h);
+  ASSERT_TRUE (out_buf != NULL);
+  mem = gst_buffer_peek_memory (out_buf, 0);
+  ASSERT_TRUE (gst_tensor_meta_info_parse_memory (&meta, mem));
+  EXPECT_EQ (meta.dimension[0], 9U);
+  EXPECT_EQ (meta.dimension[1], 6U);
+  hsize = gst_tensor_meta_info_get_header_size (&meta);
+  _check_padded_uint8 (mem, hsize, 4, 3, 2, 3, 1, 2);
+  gst_buffer_unref (out_buf);
+
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Test for changing to a mode that does not fit a static input while
+ *        the output is flexible (#4933). The flexible caps cannot refuse it,
+ *        so the buffer is refused instead.
+ */
+TEST (testTensorTransform, modeNotFitFlexibleOutputWhileStreaming_n)
+{
+  GstHarness *h;
+  GstTensorsConfig config;
+  GstBuffer *out_buf;
+
+  h = gst_harness_new ("tensor_transform");
+  ASSERT_TRUE (NULL != h);
+
+  g_object_set (h->element, "mode", GTT_ARITHMETIC, "option", "add:1", NULL);
+  gst_harness_set_sink_caps_str (h, GST_TENSORS_FLEX_CAP_DEFAULT);
+
+  gst_tensors_config_init (&config);
+  config.info.num_tensors = 1U;
+  config.info.info[0].type = _NNS_UINT8;
+  gst_tensor_parse_dimension ("4:3", config.info.info[0].dimension);
+  config.rate_n = 0;
+  config.rate_d = 1;
+
+  gst_harness_set_src_caps (h, gst_tensors_caps_from_config (&config));
+
+  EXPECT_EQ (gst_harness_push (h, _new_uint8_sequence (h, 12)), GST_FLOW_OK);
+  out_buf = gst_harness_try_pull (h);
+  ASSERT_TRUE (out_buf != NULL);
+  gst_buffer_unref (out_buf);
+
+  /* the tensor has no third dimension for the second one to move to */
+  g_object_set (h->element, "mode", GTT_DIMCHG, "option", "1:2", NULL);
+
+  EXPECT_EQ (gst_harness_push (h, _new_uint8_sequence (h, 12)), GST_FLOW_ERROR);
+  EXPECT_EQ (gst_harness_buffers_received (h), 1U);
+
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Test for a mode that does not fit a static input whose output is
+ *        flexible, set before the caps are negotiated. The flexible caps
+ *        cannot refuse it, so the caps are refused at set_caps instead of
+ *        producing a tensor without a valid header.
+ */
+TEST (testTensorTransform, dimchgStaticToFlexibleShortRank_n)
+{
+  GstHarness *h;
+  GstTensorsConfig config;
+
+  h = gst_harness_new ("tensor_transform");
+  ASSERT_TRUE (NULL != h);
+
+  g_object_set (h->element, "mode", GTT_DIMCHG, "option", "1:2", NULL);
+  gst_harness_set_sink_caps_str (h, GST_TENSORS_FLEX_CAP_DEFAULT);
+
+  gst_tensors_config_init (&config);
+  config.info.num_tensors = 1U;
+  config.info.info[0].type = _NNS_UINT8;
+  gst_tensor_parse_dimension ("4:3", config.info.info[0].dimension);
+  config.rate_n = 0;
+  config.rate_d = 1;
+
+  gst_harness_set_src_caps (h, gst_tensors_caps_from_config (&config));
+
+  EXPECT_EQ (gst_harness_push (h, _new_uint8_sequence (h, 12)), GST_FLOW_NOT_NEGOTIATED);
+  EXPECT_EQ (gst_harness_buffers_received (h), 0U);
+
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Meta whose copy changes a property of tensor_transform, to set it
+ *        after the element checked for a pending renegotiation and before it
+ *        transforms the buffer.
+ */
+typedef struct {
+  GstMeta meta; /**< parent */
+  GstElement *element; /**< tensor_transform to be changed */
+  const gchar *option; /**< new option */
+} TransformPropHookMeta;
+
+/**
+ * @brief Number of times the hook meta changed the option
+ */
+static guint _prop_hook_count = 0;
+
+/**
+ * @brief Get the API type of the hook meta
+ */
+static GType
+_prop_hook_meta_api_get_type (void)
+{
+  static GType type = 0;
+  static const gchar *tags[] = { NULL };
+
+  if (g_once_init_enter (&type)) {
+    GType _type = gst_meta_api_type_register ("TransformPropHookMetaAPI", tags);
+    g_once_init_leave (&type, _type);
+  }
+
+  return type;
+}
+
+/**
+ * @brief Initialize the hook meta
+ */
+static gboolean
+_prop_hook_meta_init (GstMeta *meta, gpointer params, GstBuffer *buffer)
+{
+  TransformPropHookMeta *hook = (TransformPropHookMeta *) meta;
+
+  UNUSED (params);
+  UNUSED (buffer);
+
+  hook->element = NULL;
+  hook->option = NULL;
+  return TRUE;
+}
+
+/**
+ * @brief Change the option when the base transform copies the metadata
+ */
+static gboolean
+_prop_hook_meta_transform (GstBuffer *dest, GstMeta *meta, GstBuffer *buffer,
+    GQuark type, gpointer data)
+{
+  TransformPropHookMeta *hook = (TransformPropHookMeta *) meta;
+
+  UNUSED (dest);
+  UNUSED (buffer);
+  UNUSED (type);
+  UNUSED (data);
+
+  if (hook->element && hook->option) {
+    g_object_set (hook->element, "option", hook->option, NULL);
+    _prop_hook_count++;
+  }
+
+  return TRUE;
+}
+
+/**
+ * @brief Get the info of the hook meta
+ */
+static const GstMetaInfo *
+_prop_hook_meta_get_info (void)
+{
+  static const GstMetaInfo *info = NULL;
+
+  if (g_once_init_enter (&info)) {
+    const GstMetaInfo *_info = gst_meta_register (_prop_hook_meta_api_get_type (),
+        "TransformPropHookMeta", sizeof (TransformPropHookMeta),
+        _prop_hook_meta_init, NULL, _prop_hook_meta_transform);
+    g_once_init_leave (&info, _info);
+  }
+
+  return info;
+}
+
+/**
+ * @brief Test for a property change that lands after the element checked for
+ *        a pending renegotiation (#4933). The buffer caught in between is
+ *        dropped, and the next one goes out with the renegotiated caps.
+ */
+TEST (testTensorTransform, optionChangeBeforeTransform)
+{
+  GstHarness *h;
+  GstTensorsConfig config, out_config;
+  GstBuffer *in_buf, *out_buf;
+  TransformPropHookMeta *hook;
+
+  h = gst_harness_new ("tensor_transform");
+  ASSERT_TRUE (NULL != h);
+
+  g_object_set (h->element, "mode", GTT_PADDING, "option", "left:1,right:1", NULL);
+
+  gst_tensors_config_init (&config);
+  config.info.num_tensors = 1U;
+  config.info.info[0].type = _NNS_UINT8;
+  gst_tensor_parse_dimension ("4:3:1:1", config.info.info[0].dimension);
+  config.rate_n = 0;
+  config.rate_d = 1;
+
+  gst_harness_set_src_caps (h, gst_tensors_caps_from_config (&config));
+
+  EXPECT_EQ (gst_harness_push (h, _new_uint8_sequence (h, 12)), GST_FLOW_OK);
+  out_buf = gst_harness_try_pull (h);
+  ASSERT_TRUE (out_buf != NULL);
+  gst_buffer_unref (out_buf);
+
+  _prop_hook_count = 0;
+  in_buf = _new_uint8_sequence (h, 12);
+  hook = (TransformPropHookMeta *) gst_buffer_add_meta (
+      in_buf, _prop_hook_meta_get_info (), NULL);
+  ASSERT_TRUE (hook != NULL);
+  hook->element = h->element;
+  hook->option = "left:2,right:2,top:1,bottom:1";
+
+  EXPECT_EQ (gst_harness_push (h, in_buf), GST_FLOW_OK);
+  EXPECT_EQ (_prop_hook_count, 1U);
+  EXPECT_EQ (gst_harness_buffers_received (h), 1U);
+
+  EXPECT_EQ (gst_harness_push (h, _new_uint8_sequence (h, 12)), GST_FLOW_OK);
+  out_buf = gst_harness_try_pull (h);
+  ASSERT_TRUE (out_buf != NULL);
+  ASSERT_TRUE (_get_harness_sink_config (h, &out_config));
+  EXPECT_EQ (gst_buffer_get_size (out_buf),
+      gst_tensors_info_get_size (&out_config.info, 0));
+  _check_padded_uint8 (gst_buffer_peek_memory (out_buf, 0), 0, 4, 3, 2, 2, 1, 1);
+  gst_tensors_config_free (&out_config);
+  gst_buffer_unref (out_buf);
+
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Test for setting the properties to what the element already does
+ *        (#4933). A rejected option, the same option, the same mode and the
+ *        same apply list are no change, so they do not ask for a
+ *        renegotiation, while a new option or apply list does.
+ */
+TEST (testTensorTransform, unchangedPropsKeepNegotiation)
+{
+  GstHarness *h;
+  GstTensorsConfig config;
+  GstBuffer *out_buf;
+  GstPad *srcpad;
+
+  h = gst_harness_new ("tensor_transform");
+  ASSERT_TRUE (NULL != h);
+
+  g_object_set (h->element, "mode", GTT_ARITHMETIC, "option", "add:1", NULL);
+
+  gst_tensors_config_init (&config);
+  config.info.num_tensors = 1U;
+  config.info.info[0].type = _NNS_UINT8;
+  gst_tensor_parse_dimension ("5", config.info.info[0].dimension);
+  config.rate_n = 0;
+  config.rate_d = 1;
+
+  gst_harness_set_src_caps (h, gst_tensors_caps_from_config (&config));
+
+  /* the first buffer consumes the reconfiguration pending since the start */
+  EXPECT_EQ (gst_harness_push (h, _new_uint8_sequence (h, 5)), GST_FLOW_OK);
+  out_buf = gst_harness_try_pull (h);
+  ASSERT_TRUE (out_buf != NULL);
+  gst_buffer_unref (out_buf);
+
+  srcpad = gst_element_get_static_pad (h->element, "src");
+  EXPECT_FALSE (gst_pad_needs_reconfigure (srcpad));
+
+  g_object_set (h->element, "option", "nonsense", NULL);
+  EXPECT_FALSE (gst_pad_needs_reconfigure (srcpad));
+
+  g_object_set (h->element, "option", "add:1", NULL);
+  EXPECT_FALSE (gst_pad_needs_reconfigure (srcpad));
+
+  g_object_set (h->element, "mode", GTT_ARITHMETIC, NULL);
+  EXPECT_FALSE (gst_pad_needs_reconfigure (srcpad));
+
+  /* no tensor selected is what the element starts with */
+  g_object_set (h->element, "apply", "", NULL);
+  EXPECT_FALSE (gst_pad_needs_reconfigure (srcpad));
+
+  g_object_set (h->element, "apply", "0,1", NULL);
+  EXPECT_TRUE (gst_pad_check_reconfigure (srcpad));
+
+  g_object_set (h->element, "apply", "0,1", NULL);
+  EXPECT_FALSE (gst_pad_needs_reconfigure (srcpad));
+
+  g_object_set (h->element, "apply", "0", NULL);
+  EXPECT_TRUE (gst_pad_check_reconfigure (srcpad));
+
+  g_object_set (h->element, "option", "add:2", NULL);
+  EXPECT_TRUE (gst_pad_needs_reconfigure (srcpad));
+
+  gst_object_unref (srcpad);
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Test for a change whose renegotiation never runs (#4933). If the
+ *        pending reconfiguration is consumed elsewhere, the output does not
+ *        match the negotiated caps and the buffer is refused, not written.
+ */
+TEST (testTensorTransform, staleConfigWithoutRenegotiation_n)
+{
+  GstHarness *h;
+  GstTensorsConfig config;
+  GstBuffer *out_buf;
+  GstPad *srcpad;
+
+  h = gst_harness_new ("tensor_transform");
+  ASSERT_TRUE (NULL != h);
+
+  g_object_set (h->element, "mode", GTT_PADDING, "option", "left:1,right:1", NULL);
+
+  gst_tensors_config_init (&config);
+  config.info.num_tensors = 1U;
+  config.info.info[0].type = _NNS_UINT8;
+  gst_tensor_parse_dimension ("4:3:1:1", config.info.info[0].dimension);
+  config.rate_n = 0;
+  config.rate_d = 1;
+
+  gst_harness_set_src_caps (h, gst_tensors_caps_from_config (&config));
+
+  EXPECT_EQ (gst_harness_push (h, _new_uint8_sequence (h, 12)), GST_FLOW_OK);
+  out_buf = gst_harness_try_pull (h);
+  ASSERT_TRUE (out_buf != NULL);
+  gst_buffer_unref (out_buf);
+
+  g_object_set (h->element, "option", "left:2,right:2", NULL);
+
+  /* take the flag the base class would renegotiate on */
+  srcpad = gst_element_get_static_pad (h->element, "src");
+  EXPECT_TRUE (gst_pad_check_reconfigure (srcpad));
+  gst_object_unref (srcpad);
+
+  EXPECT_EQ (gst_harness_push (h, _new_uint8_sequence (h, 12)), GST_FLOW_NOT_NEGOTIATED);
+  EXPECT_EQ (gst_harness_buffers_received (h), 1U);
+
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Data for the query probe changing the option of tensor_transform
+ */
+typedef struct {
+  GstElement *element; /**< tensor_transform to be changed */
+  GstQueryType type; /**< query to change the option in */
+  const gchar *options[2]; /**< options to set in turn */
+  guint remaining; /**< number of changes still to make */
+  guint changes; /**< number of changes made */
+} transform_query_hook_s;
+
+/**
+ * @brief Query probe changing the option while a downstream query is made,
+ *        which stands in for an application thread setting it during the
+ *        renegotiation of a previous change.
+ */
+static GstPadProbeReturn
+_transform_query_hook_probe (GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
+{
+  transform_query_hook_s *hook = (transform_query_hook_s *) user_data;
+  GstQuery *query = GST_PAD_PROBE_INFO_QUERY (info);
+
+  UNUSED (pad);
+
+  if ((GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_PUSH)
+      && GST_QUERY_TYPE (query) == hook->type && hook->remaining > 0) {
+    g_object_set (hook->element, "option", hook->options[hook->changes % 2], NULL);
+    hook->changes++;
+    hook->remaining--;
+  }
+
+  return GST_PAD_PROBE_OK;
+}
+
+/**
+ * @brief Pull the output of a typecast transform fed by
+ *        _new_uint8_sequence (h, 8) and check that it went out as float64.
+ */
+static void
+_check_typecast_float64 (GstHarness *h)
+{
+  GstTensorsConfig out_config;
+  GstBuffer *out_buf;
+  GstMapInfo info;
+  guint i;
+
+  out_buf = gst_harness_try_pull (h);
+  ASSERT_TRUE (out_buf != NULL);
+  ASSERT_TRUE (_get_harness_sink_config (h, &out_config));
+  EXPECT_EQ (out_config.info.info[0].type, _NNS_FLOAT64);
+  gst_tensors_config_free (&out_config);
+
+  ASSERT_TRUE (gst_buffer_map (out_buf, &info, GST_MAP_READ));
+  EXPECT_EQ (info.size, 8 * sizeof (double));
+  if (info.size == 8 * sizeof (double)) {
+    for (i = 0; i < 8; i++)
+      EXPECT_DOUBLE_EQ (((double *) info.data)[i], (double) (i + 1));
+  }
+  gst_buffer_unmap (out_buf, &info);
+  gst_buffer_unref (out_buf);
+}
+
+/**
+ * @brief Count the warnings the element posted on the bus, and drop them
+ */
+static guint
+_pop_element_warnings (GstBus *bus, GstElement *element)
+{
+  GstMessage *msg;
+  guint count = 0;
+
+  while ((msg = gst_bus_pop_filtered (bus, GST_MESSAGE_WARNING)) != NULL) {
+    if (GST_MESSAGE_SRC (msg) == GST_OBJECT_CAST (element))
+      count++;
+    gst_message_unref (msg);
+  }
+
+  return count;
+}
+
+/**
+ * @brief Set up a typecast transform of 8 uint8 elements to float32, push
+ *        one buffer through it, and change the option to the given type.
+ * @param option the type the option is changed to after the first buffer
+ * @param sink_caps caps the harness sink accepts, or NULL for any
+ * @param bus bus set on the element to collect its messages
+ * @return the harness, to be released with _teardown_typecast_harness()
+ */
+static GstHarness *
+_new_typecast_harness_changed_to (const gchar *option, const gchar *sink_caps, GstBus *bus)
+{
+  GstHarness *h = gst_harness_new ("tensor_transform");
+  GstTensorsConfig config;
+  GstBuffer *out_buf;
+
+  gst_element_set_bus (h->element, bus);
+  g_object_set (h->element, "mode", GTT_TYPECAST, "option", "float32", NULL);
+  g_object_set (h->element, "acceleration", (gboolean) FALSE, NULL);
+  if (sink_caps)
+    gst_harness_set_sink_caps_str (h, sink_caps);
+
+  gst_tensors_config_init (&config);
+  config.info.num_tensors = 1U;
+  config.info.info[0].type = _NNS_UINT8;
+  gst_tensor_parse_dimension ("8", config.info.info[0].dimension);
+  config.rate_n = 0;
+  config.rate_d = 1;
+
+  gst_harness_set_src_caps (h, gst_tensors_caps_from_config (&config));
+
+  if (gst_harness_push (h, _new_uint8_sequence (h, 8)) == GST_FLOW_OK) {
+    out_buf = gst_harness_try_pull (h);
+    if (out_buf)
+      gst_buffer_unref (out_buf);
+  }
+
+  g_object_set (h->element, "option", option, NULL);
+  _pop_element_warnings (bus, h->element);
+  return h;
+}
+
+/**
+ * @brief Tear down a harness made by _new_typecast_harness_changed_to()
+ */
+static void
+_teardown_typecast_harness (GstHarness *h, GstBus *bus)
+{
+  gst_harness_teardown (h);
+  gst_bus_set_flushing (bus, TRUE);
+  gst_object_unref (bus);
+}
+
+/**
+ * @brief Test for a second change landing while the first one is being
+ *        renegotiated, during the query that asks downstream to accept the
+ *        new caps (#4933). The element negotiates again with the latest
+ *        values instead of stopping the stream.
+ */
+TEST (testTensorTransform, secondChangeDuringAcceptCaps)
+{
+  transform_query_hook_s hook
+      = { NULL, GST_QUERY_ACCEPT_CAPS, { "float64", "float64" }, 1U, 0U };
+  GstBus *bus = gst_bus_new ();
+  GstHarness *h;
+  gulong probe_id;
+
+  h = _new_typecast_harness_changed_to ("int32", NULL, bus);
+  ASSERT_EQ (gst_harness_buffers_received (h), 1U);
+
+  hook.element = h->element;
+  probe_id = gst_pad_add_probe (h->sinkpad, GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM,
+      _transform_query_hook_probe, &hook, NULL);
+
+  EXPECT_EQ (gst_harness_push (h, _new_uint8_sequence (h, 8)), GST_FLOW_OK);
+  EXPECT_EQ (hook.changes, 1U);
+  /* the attempt the second change interrupted, and no other */
+  EXPECT_EQ (_pop_element_warnings (bus, h->element), 1U);
+  _check_typecast_float64 (h);
+
+  gst_pad_remove_probe (h->sinkpad, probe_id);
+  _teardown_typecast_harness (h, bus);
+}
+
+/**
+ * @brief Test for a second change landing during the peer caps query of a
+ *        renegotiation while downstream also accepts flexible tensors
+ *        (#4933). That buffer may go out as a flexible tensor; either way it
+ *        describes its own data, and the next buffer is negotiated as a
+ *        static tensor of the latest type.
+ */
+TEST (testTensorTransform, secondChangeDuringCapsQueryFlexibleSink)
+{
+  transform_query_hook_s hook
+      = { NULL, GST_QUERY_CAPS, { "float64", "float64" }, 1U, 0U };
+  GstBus *bus = gst_bus_new ();
+  GstTensorsConfig out_config;
+  GstTensorMetaInfo meta;
+  GstHarness *h;
+  GstBuffer *out_buf;
+  GstMapInfo info;
+  gsize hsize = 0;
+  gulong probe_id;
+  guint i;
+
+  h = _new_typecast_harness_changed_to ("int32", NULL, bus);
+  ASSERT_EQ (gst_harness_buffers_received (h), 1U);
+
+  hook.element = h->element;
+  probe_id = gst_pad_add_probe (h->sinkpad, GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM,
+      _transform_query_hook_probe, &hook, NULL);
+
+  EXPECT_EQ (gst_harness_push (h, _new_uint8_sequence (h, 8)), GST_FLOW_OK);
+  EXPECT_EQ (hook.changes, 1U);
+  gst_pad_remove_probe (h->sinkpad, probe_id);
+
+  out_buf = gst_harness_try_pull (h);
+  ASSERT_TRUE (out_buf != NULL);
+  ASSERT_TRUE (_get_harness_sink_config (h, &out_config));
+
+  if (gst_tensors_config_is_flexible (&out_config)) {
+    ASSERT_EQ (gst_buffer_n_memory (out_buf), 1U);
+    ASSERT_TRUE (gst_tensor_meta_info_parse_memory (
+        &meta, gst_buffer_peek_memory (out_buf, 0)));
+    EXPECT_EQ (meta.type, _NNS_FLOAT64);
+    EXPECT_EQ (meta.dimension[0], 8U);
+    hsize = gst_tensor_meta_info_get_header_size (&meta);
+  } else {
+    EXPECT_EQ (out_config.info.info[0].type, _NNS_FLOAT64);
+  }
+  gst_tensors_config_free (&out_config);
+
+  ASSERT_TRUE (gst_buffer_map (out_buf, &info, GST_MAP_READ));
+  EXPECT_EQ (info.size, hsize + 8 * sizeof (double));
+  if (info.size == hsize + 8 * sizeof (double)) {
+    for (i = 0; i < 8; i++)
+      EXPECT_DOUBLE_EQ (((double *) (info.data + hsize))[i], (double) (i + 1));
+  }
+  gst_buffer_unmap (out_buf, &info);
+  gst_buffer_unref (out_buf);
+
+  EXPECT_EQ (gst_harness_push (h, _new_uint8_sequence (h, 8)), GST_FLOW_OK);
+  _check_typecast_float64 (h);
+
+  _teardown_typecast_harness (h, bus);
+}
+
+/**
+ * @brief Test for a change downstream refuses, with no other change during
+ *        its negotiation (#4933). The element negotiates once and reports
+ *        not-negotiated, instead of trying again with the same values.
+ */
+TEST (testTensorTransform, refusedChangeNegotiatedOnce_n)
+{
+  GstBus *bus = gst_bus_new ();
+  GstHarness *h;
+
+  h = _new_typecast_harness_changed_to ("float64",
+      "other/tensors,format=static,num_tensors=1,types=float32,dimensions=8:1:1:1,framerate=0/1",
+      bus);
+  ASSERT_EQ (gst_harness_buffers_received (h), 1U);
+
+  EXPECT_EQ (gst_harness_push (h, _new_uint8_sequence (h, 8)), GST_FLOW_NOT_NEGOTIATED);
+  EXPECT_EQ (_pop_element_warnings (bus, h->element), 1U);
+  EXPECT_EQ (gst_harness_buffers_received (h), 1U);
+
+  _teardown_typecast_harness (h, bus);
+}
+
+/**
+ * @brief Test for property changes that keep landing during renegotiation
+ *        (#4933). The element gives up after a bounded number of attempts
+ *        and reports not-negotiated, and negotiates again once the changes
+ *        stop.
+ */
+TEST (testTensorTransform, renegotiationAttemptsBounded_n)
+{
+  transform_query_hook_s hook
+      = { NULL, GST_QUERY_ACCEPT_CAPS, { "int32", "float64" }, 1000U, 0U };
+  GstBus *bus = gst_bus_new ();
+  GstHarness *h;
+  gulong probe_id;
+
+  h = _new_typecast_harness_changed_to ("uint16", NULL, bus);
+  ASSERT_EQ (gst_harness_buffers_received (h), 1U);
+
+  hook.element = h->element;
+  probe_id = gst_pad_add_probe (h->sinkpad, GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM,
+      _transform_query_hook_probe, &hook, NULL);
+
+  /* every attempt sees a new change, so the attempts have to stop somewhere */
+  EXPECT_EQ (gst_harness_push (h, _new_uint8_sequence (h, 8)), GST_FLOW_NOT_NEGOTIATED);
+  EXPECT_GT (hook.changes, 1U);
+  EXPECT_LT (hook.changes, 1000U);
+  /* gsttensor_transform.md documents 8 attempts per buffer */
+  EXPECT_EQ (_pop_element_warnings (bus, h->element), 8U);
+  EXPECT_EQ (gst_harness_buffers_received (h), 1U);
+
+  gst_pad_remove_probe (h->sinkpad, probe_id);
+
+  g_object_set (h->element, "option", "float64", NULL);
+  EXPECT_EQ (gst_harness_push (h, _new_uint8_sequence (h, 8)), GST_FLOW_OK);
+  _check_typecast_float64 (h);
+
+  _teardown_typecast_harness (h, bus);
+}
+
+/**
+ * @brief Data for the pipeline changing the option of tensor_transform
+ */
+typedef struct {
+  GstElement *transform; /**< tensor_transform to be changed */
+  const gchar *options[2]; /**< options to toggle */
+  guint period; /**< change the option every period buffers */
+  guint count; /**< buffers arrived at tensor_transform */
+  guint received; /**< buffers arrived at the sink */
+  guint mismatched; /**< buffers at the sink not matching their caps */
+  guint caps_seen; /**< caps events arrived at the sink */
+} transform_pipeline_data_s;
+
+/**
+ * @brief Probe on the sink pad of tensor_transform toggling the option
+ */
+static GstPadProbeReturn
+_transform_toggle_probe (GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
+{
+  transform_pipeline_data_s *data = (transform_pipeline_data_s *) user_data;
+
+  UNUSED (pad);
+  UNUSED (info);
+
+  if (data->count > 0 && data->count % data->period == 0)
+    g_object_set (data->transform, "option",
+        data->options[(data->count / data->period) % 2], NULL);
+
+  data->count++;
+  return GST_PAD_PROBE_OK;
+}
+
+/**
+ * @brief Probe on the sink pad of the sink comparing each buffer with its caps
+ */
+static GstPadProbeReturn
+_transform_sink_check_probe (GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
+{
+  transform_pipeline_data_s *data = (transform_pipeline_data_s *) user_data;
+  GstTensorsConfig config;
+  GstCaps *caps;
+
+  if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_BUFFER) {
+    data->received++;
+
+    gst_tensors_config_init (&config);
+    caps = gst_pad_get_current_caps (pad);
+    if (!caps || !gst_tensors_config_from_caps (&config, caps, TRUE)
+        || gst_buffer_get_size (GST_PAD_PROBE_INFO_BUFFER (info))
+               != gst_tensors_info_get_size (&config.info, 0))
+      data->mismatched++;
+
+    if (caps)
+      gst_caps_unref (caps);
+    gst_tensors_config_free (&config);
+  } else if (GST_EVENT_TYPE (GST_PAD_PROBE_INFO_EVENT (info)) == GST_EVENT_CAPS) {
+    data->caps_seen++;
+  }
+
+  return GST_PAD_PROBE_OK;
+}
+
+/**
+ * @brief Run a pipeline of tensor_transform named "tr" and a sink named
+ *        "sink", toggling the option of the transform while it streams.
+ * @return the type of the message that ended the stream,
+ *         GST_MESSAGE_UNKNOWN on a timeout, or GST_MESSAGE_ANY if the
+ *         description does not parse or lacks "tr" or "sink".
+ */
+static GstMessageType
+_run_transform_toggle_pipeline (const gchar *description, transform_pipeline_data_s *data)
+{
+  GstElement *pipeline, *sink;
+  GstPad *pad;
+  GstBus *bus;
+  GstMessage *msg;
+  GstMessageType type = GST_MESSAGE_UNKNOWN;
+
+  pipeline = gst_parse_launch (description, NULL);
+  if (pipeline == NULL)
+    return GST_MESSAGE_ANY;
+
+  data->transform = gst_bin_get_by_name (GST_BIN (pipeline), "tr");
+  sink = gst_bin_get_by_name (GST_BIN (pipeline), "sink");
+  if (data->transform == NULL || sink == NULL) {
+    g_clear_object (&data->transform);
+    g_clear_object (&sink);
+    gst_object_unref (pipeline);
+    return GST_MESSAGE_ANY;
+  }
+
+  pad = gst_element_get_static_pad (data->transform, "sink");
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, _transform_toggle_probe, data, NULL);
+  gst_object_unref (pad);
+
+  pad = gst_element_get_static_pad (sink, "sink");
+  gst_pad_add_probe (pad,
+      (GstPadProbeType) (GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM),
+      _transform_sink_check_probe, data, NULL);
+  gst_object_unref (pad);
+
+  /* the stream may fail before the state change completes, so ask the bus */
+  gst_element_set_state (pipeline, GST_STATE_PLAYING);
+  bus = gst_element_get_bus (pipeline);
+  msg = gst_bus_timed_pop_filtered (bus, 10 * GST_SECOND,
+      (GstMessageType) (GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+  if (msg) {
+    type = GST_MESSAGE_TYPE (msg);
+    gst_message_unref (msg);
+  }
+  gst_object_unref (bus);
+
+  setPipelineStateSync (pipeline, GST_STATE_NULL, UNITTEST_STATECHANGE_TIMEOUT);
+  gst_object_unref (sink);
+  gst_object_unref (data->transform);
+  gst_object_unref (pipeline);
+  data->transform = NULL;
+
+  return type;
+}
+
+/**
+ * @brief Test for changing the padding in a playing pipeline (#4933). Every
+ *        change renegotiates the caps down to the sink, and every buffer the
+ *        sink receives is as large as its caps describe.
+ */
+TEST (testTensorTransform, paddingChangeInPipeline)
+{
+  const gchar *description
+      = "videotestsrc num-buffers=30 ! "
+        "video/x-raw,format=GRAY8,width=4,height=4,framerate=30/1 ! "
+        "tensor_converter ! tensor_transform name=tr mode=padding option=left:1,right:1 ! "
+        "fakesink name=sink sync=false";
+  transform_pipeline_data_s data = { NULL,
+    { "left:1,right:1", "left:2,right:2,top:1,bottom:1" }, 5U, 0U, 0U, 0U, 0U };
+
+  EXPECT_EQ (_run_transform_toggle_pipeline (description, &data), GST_MESSAGE_EOS);
+
+  EXPECT_EQ (data.count, 30U);
+  EXPECT_EQ (data.received, 30U);
+  EXPECT_EQ (data.mismatched, 0U);
+  /* the initial caps and one for each of the five changes */
+  EXPECT_GE (data.caps_seen, 6U);
+}
+
+/**
+ * @brief Test for changing the type in a playing pipeline whose downstream
+ *        accepts only the first output (#4933). The stream stops with an
+ *        error instead of going on with a type nobody negotiated.
+ */
+TEST (testTensorTransform, typecastChangeRefusedDownstream_n)
+{
+  const gchar *description
+      = "videotestsrc num-buffers=30 ! "
+        "video/x-raw,format=GRAY8,width=4,height=4,framerate=30/1 ! "
+        "tensor_converter ! tensor_transform name=tr mode=typecast option=uint16 ! "
+        "other/tensors,format=static,num_tensors=1,types=uint16 ! "
+        "fakesink name=sink sync=false";
+  transform_pipeline_data_s data = { NULL, { "uint16", "float32" }, 3U, 0U, 0U, 0U, 0U };
+
+  EXPECT_EQ (_run_transform_toggle_pipeline (description, &data), GST_MESSAGE_ERROR);
+
+  EXPECT_EQ (data.received, 3U);
+  EXPECT_EQ (data.mismatched, 0U);
+}
+
+/**
+ * @brief Data for the pipeline changing the option again during the peer
+ *        caps query of a renegotiation
+ */
+typedef struct {
+  transform_pipeline_data_s check; /**< buffers and caps seen at the sink */
+  transform_query_hook_s hook; /**< second change, made from the query */
+  GstPad *hook_pad; /**< pad the query probe is added to once armed */
+} transform_second_change_s;
+
+/**
+ * @brief Buffer probe on tensor_transform making the first change at the
+ *        sixth buffer and arming the query probe for the second one
+ */
+static GstPadProbeReturn
+_transform_first_change_probe (GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
+{
+  transform_second_change_s *data = (transform_second_change_s *) user_data;
+
+  UNUSED (pad);
+  UNUSED (info);
+
+  if (data->check.count == 5U) {
+    g_object_set (data->hook.element, "option", "int32", NULL);
+    gst_pad_add_probe (data->hook_pad, GST_PAD_PROBE_TYPE_QUERY_DOWNSTREAM,
+        _transform_query_hook_probe, &data->hook, NULL);
+  }
+
+  data->check.count++;
+  return GST_PAD_PROBE_OK;
+}
+
+/**
+ * @brief Test for a second change landing during the peer caps query of the
+ *        first one's renegotiation, with a downstream that takes static caps
+ *        only (#4933). The stream reaches EOS with the latest type, and every
+ *        buffer at the sink matches its caps.
+ */
+TEST (testTensorTransform, secondChangeDuringPeerCapsQuery)
+{
+  const gchar *description
+      = "videotestsrc num-buffers=30 ! "
+        "video/x-raw,format=GRAY8,width=4,height=4,framerate=30/1 ! "
+        "tensor_converter ! tensor_transform name=tr mode=typecast option=float32 ! "
+        "capsfilter name=cf caps=other/tensors,format=static ! "
+        "fakesink name=sink sync=false";
+  transform_second_change_s data;
+  GstElement *pipeline, *sink, *cf;
+  GstTensorsConfig config;
+  GstCaps *caps;
+  GstPad *pad;
+  GstBus *bus;
+  GstMessage *msg;
+  GstMessageType type = GST_MESSAGE_UNKNOWN;
+
+  memset (&data, 0, sizeof (data));
+  data.hook.type = GST_QUERY_CAPS;
+  data.hook.options[0] = data.hook.options[1] = "float64";
+  data.hook.remaining = 1U;
+
+  pipeline = gst_parse_launch (description, NULL);
+  ASSERT_TRUE (pipeline != nullptr);
+
+  data.hook.element = gst_bin_get_by_name (GST_BIN (pipeline), "tr");
+  sink = gst_bin_get_by_name (GST_BIN (pipeline), "sink");
+  cf = gst_bin_get_by_name (GST_BIN (pipeline), "cf");
+  ASSERT_TRUE (data.hook.element != nullptr);
+  ASSERT_TRUE (sink != nullptr);
+  ASSERT_TRUE (cf != nullptr);
+  data.hook_pad = gst_element_get_static_pad (cf, "sink");
+
+  pad = gst_element_get_static_pad (data.hook.element, "sink");
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER,
+      _transform_first_change_probe, &data, NULL);
+  gst_object_unref (pad);
+
+  pad = gst_element_get_static_pad (sink, "sink");
+  gst_pad_add_probe (pad,
+      (GstPadProbeType) (GST_PAD_PROBE_TYPE_BUFFER | GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM),
+      _transform_sink_check_probe, &data.check, NULL);
+
+  gst_element_set_state (pipeline, GST_STATE_PLAYING);
+  bus = gst_element_get_bus (pipeline);
+  msg = gst_bus_timed_pop_filtered (bus, 10 * GST_SECOND,
+      (GstMessageType) (GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+  if (msg) {
+    type = GST_MESSAGE_TYPE (msg);
+    gst_message_unref (msg);
+  }
+  gst_object_unref (bus);
+
+  EXPECT_EQ (type, GST_MESSAGE_EOS);
+  EXPECT_EQ (data.hook.changes, 1U);
+  EXPECT_EQ (data.check.received, 30U);
+  EXPECT_EQ (data.check.mismatched, 0U);
+
+  gst_tensors_config_init (&config);
+  caps = gst_pad_get_current_caps (pad);
+  EXPECT_TRUE (caps != NULL);
+  if (caps) {
+    EXPECT_TRUE (gst_tensors_config_from_caps (&config, caps, TRUE));
+    EXPECT_EQ (config.info.info[0].type, _NNS_FLOAT64);
+    gst_caps_unref (caps);
+  }
+  gst_tensors_config_free (&config);
+  gst_object_unref (pad);
+
+  setPipelineStateSync (pipeline, GST_STATE_NULL, UNITTEST_STATECHANGE_TIMEOUT);
+  gst_object_unref (data.hook_pad);
+  gst_object_unref (cf);
+  gst_object_unref (sink);
+  gst_object_unref (data.hook.element);
+  gst_object_unref (pipeline);
+}
+
+/**
  * @brief Test for tensor_transform, a static tensor shorter than the caps
  */
 TEST (testTensorTransform, pushShortTensor_n)
@@ -1943,13 +3303,14 @@ TEST (testTensorTransform, pushLongTensor)
 }
 
 /**
- * @brief Build a uint8 flexible tensor memory of the given dimension.
+ * @brief Build a flexible tensor memory of the given type and dimension.
+ * @param type element type the meta header describes
  * @param dim_str dimension the meta header describes
  * @param with_data allocate the data the header describes, not the header alone
  * @param size bytes the memory exposes, 0 for every allocated byte
  */
 static GstMemory *
-_new_flex_memory (const gchar *dim_str, gboolean with_data, gsize size)
+_new_flex_typed_memory (tensor_type type, const gchar *dim_str, gboolean with_data, gsize size)
 {
   GstTensorMetaInfo meta;
   GstTensorInfo info;
@@ -1957,7 +3318,7 @@ _new_flex_memory (const gchar *dim_str, gboolean with_data, gsize size)
   gsize hsize, alloc;
 
   gst_tensor_info_init (&info);
-  info.type = _NNS_UINT8;
+  info.type = type;
   gst_tensor_parse_dimension (dim_str, info.dimension);
   gst_tensor_info_convert_to_meta (&info, &meta);
 
@@ -1971,6 +3332,167 @@ _new_flex_memory (const gchar *dim_str, gboolean with_data, gsize size)
   gst_tensor_meta_info_update_header (&meta, data);
 
   return gst_memory_new_wrapped ((GstMemoryFlags) 0, data, alloc, 0, size, data, g_free);
+}
+
+/**
+ * @brief Build a uint8 flexible tensor memory of the given dimension.
+ * @param dim_str dimension the meta header describes
+ * @param with_data allocate the data the header describes, not the header alone
+ * @param size bytes the memory exposes, 0 for every allocated byte
+ */
+static GstMemory *
+_new_flex_memory (const gchar *dim_str, gboolean with_data, gsize size)
+{
+  return _new_flex_typed_memory (_NNS_UINT8, dim_str, with_data, size);
+}
+
+/**
+ * @brief Test for changing the tensors a size-changing mode applies to while
+ *        a flexible stream goes through (#4933). Each tensor carries its own
+ *        header, so the applied one goes out as float32 and the excluded one
+ *        keeps its uint8 header and data, before and after the change.
+ */
+TEST (testTensorTransform, typecastApplyChangeFlexibleInput)
+{
+  const guint num_tensors = 2U;
+  const guint array_size = 8U;
+  const gchar *apply_values[] = { "0", "1" };
+  GstHarness *h;
+  GstBuffer *in_buf, *out_buf;
+  GstTensorMetaInfo meta;
+  GstCaps *caps;
+  GstMemory *mem;
+  GstMapInfo map;
+  gsize hsize;
+  guint i, j, p;
+
+  h = gst_harness_new ("tensor_transform");
+  ASSERT_TRUE (NULL != h);
+
+  g_object_set (h->element, "mode", GTT_TYPECAST, "option", "float32", NULL);
+  g_object_set (h->element, "acceleration", (gboolean) FALSE, NULL);
+
+  caps = gst_caps_from_string (GST_TENSORS_FLEX_CAP_DEFAULT);
+  gst_caps_set_simple (caps, "framerate", GST_TYPE_FRACTION, 0, 1, NULL);
+  gst_harness_set_src_caps (h, caps);
+
+  for (p = 0; p < G_N_ELEMENTS (apply_values); p++) {
+    g_object_set (h->element, "apply", apply_values[p], NULL);
+
+    in_buf = gst_buffer_new ();
+    for (i = 0; i < num_tensors; i++) {
+      mem = _new_flex_memory ("8", TRUE, 0U);
+      ASSERT_TRUE (gst_tensor_meta_info_parse_memory (&meta, mem));
+      hsize = gst_tensor_meta_info_get_header_size (&meta);
+      ASSERT_TRUE (gst_memory_map (mem, &map, GST_MAP_WRITE));
+      for (j = 0; j < array_size; j++)
+        map.data[hsize + j] = (guint8) (i * 10 + j);
+      gst_memory_unmap (mem, &map);
+      gst_buffer_append_memory (in_buf, mem);
+    }
+
+    EXPECT_EQ (gst_harness_push (h, in_buf), GST_FLOW_OK);
+    out_buf = gst_harness_try_pull (h);
+    ASSERT_TRUE (out_buf != NULL);
+    ASSERT_EQ (gst_buffer_n_memory (out_buf), num_tensors);
+
+    for (i = 0; i < num_tensors; i++) {
+      mem = gst_buffer_peek_memory (out_buf, i);
+      ASSERT_TRUE (gst_tensor_meta_info_parse_memory (&meta, mem));
+      EXPECT_EQ (meta.type, (i == p) ? _NNS_FLOAT32 : _NNS_UINT8);
+      hsize = gst_tensor_meta_info_get_header_size (&meta);
+
+      ASSERT_TRUE (gst_memory_map (mem, &map, GST_MAP_READ));
+      EXPECT_EQ (map.size, hsize + array_size * ((i == p) ? sizeof (float) : 1U));
+      if (map.size == hsize + array_size * ((i == p) ? sizeof (float) : 1U)) {
+        for (j = 0; j < array_size; j++) {
+          if (i == p)
+            EXPECT_FLOAT_EQ (((float *) (map.data + hsize))[j], (float) (i * 10 + j));
+          else
+            EXPECT_EQ (map.data[hsize + j], (guint8) (i * 10 + j));
+        }
+      }
+      gst_memory_unmap (mem, &map);
+    }
+
+    gst_buffer_unref (out_buf);
+  }
+
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Test for tensor_transform, more flexible tensors than NNS_TENSOR_MEMORY_MAX
+ * @details The tensors past the 16th are packed into the last memory of the
+ * buffer, and a flexible one is packed with its meta header, which the sizes
+ * recorded for them have to account for (item A6 of #4920, issue #4934).
+ */
+TEST (testTensorTransform, typecastFlexibleExtraTensors)
+{
+  const guint num_tensors = NNS_TENSOR_MEMORY_MAX + 2U;
+  const guint array_size = 8U;
+  GstHarness *h;
+  GstBuffer *in_buf, *out_buf;
+  GstTensorMetaInfo meta;
+  GstTensorInfo info;
+  GstCaps *caps;
+  GstMemory *mem;
+  GstMapInfo map;
+  gsize hsize;
+  guint i, j;
+
+  h = gst_harness_new ("tensor_transform");
+  ASSERT_TRUE (NULL != h);
+
+  g_object_set (h->element, "mode", GTT_TYPECAST, "option", "float32", NULL);
+  g_object_set (h->element, "acceleration", (gboolean) FALSE, NULL);
+
+  caps = gst_caps_from_string (GST_TENSORS_FLEX_CAP_DEFAULT);
+  gst_caps_set_simple (caps, "framerate", GST_TYPE_FRACTION, 0, 1, NULL);
+  gst_harness_set_src_caps (h, caps);
+
+  in_buf = gst_buffer_new ();
+  for (i = 0; i < num_tensors; i++) {
+    mem = _new_flex_memory ("8", TRUE, 0U);
+    ASSERT_TRUE (gst_tensor_meta_info_parse_memory (&meta, mem));
+    hsize = gst_tensor_meta_info_get_header_size (&meta);
+
+    ASSERT_TRUE (gst_memory_map (mem, &map, GST_MAP_WRITE));
+    for (j = 0; j < array_size; j++)
+      map.data[hsize + j] = (guint8) (i * 10 + j);
+    gst_memory_unmap (mem, &map);
+
+    gst_tensor_info_init (&info);
+    gst_tensor_meta_info_convert (&meta, &info);
+    ASSERT_TRUE (gst_tensor_buffer_append_memory (in_buf, mem, &info));
+    gst_tensor_info_free (&info);
+  }
+  ASSERT_EQ (gst_tensor_buffer_get_count (in_buf), num_tensors);
+
+  EXPECT_EQ (gst_harness_push (h, in_buf), GST_FLOW_OK);
+  out_buf = gst_harness_try_pull (h);
+  ASSERT_TRUE (out_buf != NULL);
+  ASSERT_EQ (gst_tensor_buffer_get_count (out_buf), num_tensors);
+
+  for (i = 0; i < num_tensors; i++) {
+    mem = gst_tensor_buffer_get_nth_memory (out_buf, i);
+    ASSERT_TRUE (mem != NULL);
+    ASSERT_TRUE (gst_tensor_meta_info_parse_memory (&meta, mem));
+    EXPECT_EQ (meta.type, _NNS_FLOAT32);
+    hsize = gst_tensor_meta_info_get_header_size (&meta);
+
+    ASSERT_TRUE (gst_memory_map (mem, &map, GST_MAP_READ));
+    EXPECT_EQ (map.size, hsize + array_size * sizeof (float));
+    if (map.size == hsize + array_size * sizeof (float)) {
+      for (j = 0; j < array_size; j++)
+        EXPECT_FLOAT_EQ (((float *) (map.data + hsize))[j], (float) (i * 10 + j));
+    }
+    gst_memory_unmap (mem, &map);
+    gst_memory_unref (mem);
+  }
+
+  gst_buffer_unref (out_buf);
+  gst_harness_teardown (h);
 }
 
 /**
@@ -2110,6 +3632,536 @@ TEST (testTensorTransform, pushSparseFlexibleTensor_n)
   EXPECT_EQ (gst_harness_push (h, buf), GST_FLOW_ERROR);
   EXPECT_EQ (gst_harness_buffers_received (h), 0U);
 
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Open a tensor_transform harness fed with a static tensor.
+ * @param mode transform mode
+ * @param option mode option
+ * @param accel value of the acceleration property
+ * @param type element type of the input tensor
+ * @param dim_str dimension of the input tensor
+ * @param flex_out TRUE to make the harness sink accept flexible tensors only
+ */
+static GstHarness *
+_new_transform_static_harness (tensor_transform_mode mode, const gchar *option,
+    gboolean accel, tensor_type type, const gchar *dim_str, gboolean flex_out)
+{
+  GstHarness *h;
+  GstTensorsConfig config;
+
+  h = gst_harness_new ("tensor_transform");
+  if (!h)
+    return NULL;
+
+  g_object_set (h->element, "mode", mode, "option", option, "acceleration", accel, NULL);
+
+  if (flex_out)
+    gst_harness_set_sink_caps_str (h, GST_TENSORS_FLEX_CAP_DEFAULT);
+
+  gst_tensors_config_init (&config);
+  config.info.num_tensors = 1U;
+  config.info.info[0].type = type;
+  gst_tensor_parse_dimension (dim_str, config.info.info[0].dimension);
+  config.rate_n = 0;
+  config.rate_d = 1;
+  gst_harness_set_src_caps (h, gst_tensors_caps_from_config (&config));
+  gst_tensors_config_free (&config);
+
+  return h;
+}
+
+/**
+ * @brief Test for tensor_transform, the modes only moving the elements take
+ *        float16 on every build (item G4 of #4960).
+ */
+TEST (testTensorTransform, float16DataMovingModes)
+{
+  const struct {
+    tensor_transform_mode mode;
+    const gchar *option;
+  } cases[] = {
+    { GTT_DIMCHG, "0:1" },
+    { GTT_TRANSPOSE, "1:0:2:3" },
+  };
+  const guint width = 2U, height = 3U;
+  GstHarness *h;
+  GstBuffer *in_buf, *out_buf;
+  GstMapInfo info;
+  guint c, x, y;
+
+  for (c = 0; c < G_N_ELEMENTS (cases); c++) {
+    h = _new_transform_static_harness (
+        cases[c].mode, cases[c].option, FALSE, _NNS_FLOAT16, "2:3:1:1", FALSE);
+    ASSERT_TRUE (h != NULL);
+
+    in_buf = gst_harness_create_buffer (h, width * height * sizeof (uint16_t));
+    ASSERT_TRUE (gst_buffer_map (in_buf, &info, GST_MAP_WRITE));
+    for (x = 0; x < width * height; x++)
+      ((uint16_t *) info.data)[x] = (uint16_t) (0x3C00 + x);
+    gst_buffer_unmap (in_buf, &info);
+
+    EXPECT_EQ (gst_harness_push (h, in_buf), GST_FLOW_OK);
+    out_buf = gst_harness_try_pull (h);
+    ASSERT_TRUE (out_buf != NULL);
+
+    ASSERT_TRUE (gst_buffer_map (out_buf, &info, GST_MAP_READ));
+    ASSERT_EQ (info.size, width * height * sizeof (uint16_t));
+    for (y = 0; y < height; y++) {
+      for (x = 0; x < width; x++) {
+        EXPECT_EQ (((uint16_t *) info.data)[x * height + y],
+            (uint16_t) (0x3C00 + y * width + x));
+      }
+    }
+    gst_buffer_unmap (out_buf, &info);
+    gst_buffer_unref (out_buf);
+
+    gst_harness_teardown (h);
+  }
+}
+
+#ifndef FLOAT16_SUPPORT
+/**
+ * @brief Test for tensor_transform, a float16 tensor converted by a build
+ *        without float16 support (item G4 of #4960). The caps are refused,
+ *        where the conversion used to abort the process.
+ */
+TEST (testTensorTransform, float16InputUnsupported_n)
+{
+  const struct {
+    tensor_transform_mode mode;
+    const gchar *option;
+  } cases[] = {
+    { GTT_TYPECAST, "float32" },
+    { GTT_TYPECAST, "float16" },
+    { GTT_ARITHMETIC, "add:1" },
+    { GTT_ARITHMETIC, "typecast:float32,add:1" },
+    { GTT_ARITHMETIC, "typecast:float32,per-channel:true@0,add:1@0" },
+    { GTT_STAND, "default:float32" },
+    { GTT_CLAMP, "0:1" },
+  };
+  GstHarness *h;
+  guint c, a, f;
+
+  for (c = 0; c < G_N_ELEMENTS (cases); c++) {
+    for (a = 0; a < 2U; a++) {
+      for (f = 0; f < 2U; f++) {
+        h = _new_transform_static_harness (cases[c].mode, cases[c].option,
+            (gboolean) a, _NNS_FLOAT16, "4:2", (gboolean) f);
+        ASSERT_TRUE (h != NULL);
+
+        EXPECT_EQ (gst_harness_push (h, gst_harness_create_buffer (h, 16U)),
+            GST_FLOW_NOT_NEGOTIATED);
+        EXPECT_EQ (gst_harness_buffers_received (h), 0U);
+
+        gst_harness_teardown (h);
+      }
+    }
+  }
+}
+
+/**
+ * @brief Test for tensor_transform, a float16 output requested from a build
+ *        without float16 support (item G4 of #4960).
+ */
+TEST (testTensorTransform, float16OutputUnsupported_n)
+{
+  const struct {
+    tensor_transform_mode mode;
+    const gchar *option;
+  } cases[] = {
+    { GTT_TYPECAST, "float16" },
+    { GTT_ARITHMETIC, "typecast:float16,add:1" },
+    { GTT_STAND, "default:float16" },
+  };
+  GstHarness *h;
+  guint c, a, f;
+
+  for (c = 0; c < G_N_ELEMENTS (cases); c++) {
+    for (a = 0; a < 2U; a++) {
+      for (f = 0; f < 2U; f++) {
+        h = _new_transform_static_harness (cases[c].mode, cases[c].option,
+            (gboolean) a, _NNS_UINT8, "4:2", (gboolean) f);
+        ASSERT_TRUE (h != NULL);
+
+        EXPECT_EQ (gst_harness_push (h, gst_harness_create_buffer (h, 8U)),
+            GST_FLOW_NOT_NEGOTIATED);
+        EXPECT_EQ (gst_harness_buffers_received (h), 0U);
+
+        gst_harness_teardown (h);
+      }
+    }
+  }
+}
+
+/**
+ * @brief Test for tensor_transform, a flexible tensor whose header says
+ *        float16, on a build without float16 support (item G4 of #4960).
+ */
+TEST (testTensorTransform, float16FlexibleHeaderUnsupported_n)
+{
+  const struct {
+    tensor_transform_mode mode;
+    const gchar *option;
+  } cases[] = {
+    { GTT_TYPECAST, "float32" },
+    { GTT_ARITHMETIC, "add:1" },
+    { GTT_STAND, "dc-average" },
+    { GTT_CLAMP, "0:1" },
+  };
+  GstHarness *h;
+  GstBuffer *buf;
+  GstCaps *caps;
+  guint c, a;
+
+  for (c = 0; c < G_N_ELEMENTS (cases); c++) {
+    for (a = 0; a < 2U; a++) {
+      h = gst_harness_new ("tensor_transform");
+      ASSERT_TRUE (NULL != h);
+
+      g_object_set (h->element, "mode", cases[c].mode, "option",
+          cases[c].option, "acceleration", (gboolean) a, NULL);
+
+      caps = gst_caps_from_string (GST_TENSORS_FLEX_CAP_DEFAULT);
+      gst_caps_set_simple (caps, "framerate", GST_TYPE_FRACTION, 0, 1, NULL);
+      gst_harness_set_src_caps (h, caps);
+
+      /* the second memory keeps the buffer from being re-split by the header */
+      buf = gst_buffer_new ();
+      gst_buffer_append_memory (
+          buf, _new_flex_typed_memory (_NNS_FLOAT16, "4:2", TRUE, 0U));
+      gst_buffer_append_memory (
+          buf, _new_flex_typed_memory (_NNS_FLOAT16, "4:2", TRUE, 0U));
+
+      EXPECT_EQ (gst_harness_push (h, buf), GST_FLOW_ERROR);
+      EXPECT_EQ (gst_harness_buffers_received (h), 0U);
+
+      gst_harness_teardown (h);
+    }
+  }
+}
+
+/**
+ * @brief Test for tensor_transform, switching a float16 stream to a mode
+ *        converting the values, on a build without float16 support (item G4
+ *        of #4960).
+ */
+TEST (testTensorTransform, float16ModeChangeUnsupported_n)
+{
+  GstHarness *h;
+  GstBuffer *out_buf;
+  guint f;
+
+  for (f = 0; f < 2U; f++) {
+    h = _new_transform_static_harness (
+        GTT_DIMCHG, "0:1", FALSE, _NNS_FLOAT16, "4:2", (gboolean) f);
+    ASSERT_TRUE (h != NULL);
+
+    EXPECT_EQ (gst_harness_push (h, gst_harness_create_buffer (h, 16U)), GST_FLOW_OK);
+    out_buf = gst_harness_try_pull (h);
+    ASSERT_TRUE (out_buf != NULL);
+    gst_buffer_unref (out_buf);
+
+    g_object_set (h->element, "mode", GTT_ARITHMETIC, "option", "add:1", NULL);
+
+    /* static caps are renegotiated and refused, flexible ones fail the buffer */
+    EXPECT_EQ (gst_harness_push (h, gst_harness_create_buffer (h, 16U)),
+        f ? GST_FLOW_ERROR : GST_FLOW_NOT_NEGOTIATED);
+    EXPECT_EQ (gst_harness_buffers_received (h), 1U);
+
+    gst_harness_teardown (h);
+  }
+}
+#else /* FLOAT16_SUPPORT */
+/**
+ * @brief Test for tensor_transform, a float16 tensor cast to the 64-bit
+ *        integer types (item G4 of #4960).
+ */
+TEST (testTensorTransform, float16TypecastToInt64)
+{
+  const uint16_t in_values[] = { 0x3C00, 0x4000, 0x4200, 0x4400 }; /* 1, 2, 3, 4 */
+  const gchar *options[] = { "int64", "uint64" };
+  GstHarness *h;
+  GstBuffer *in_buf, *out_buf;
+  GstMapInfo info;
+  guint o, a, i;
+
+  for (o = 0; o < G_N_ELEMENTS (options); o++) {
+    for (a = 0; a < 2U; a++) {
+      h = _new_transform_static_harness (
+          GTT_TYPECAST, options[o], (gboolean) a, _NNS_FLOAT16, "4", FALSE);
+      ASSERT_TRUE (h != NULL);
+
+      in_buf = gst_harness_create_buffer (h, sizeof (in_values));
+      gst_buffer_fill (in_buf, 0, in_values, sizeof (in_values));
+
+      EXPECT_EQ (gst_harness_push (h, in_buf), GST_FLOW_OK);
+      out_buf = gst_harness_try_pull (h);
+      ASSERT_TRUE (out_buf != NULL);
+
+      ASSERT_TRUE (gst_buffer_map (out_buf, &info, GST_MAP_READ));
+      ASSERT_EQ (info.size, G_N_ELEMENTS (in_values) * sizeof (int64_t));
+      for (i = 0; i < G_N_ELEMENTS (in_values); i++)
+        EXPECT_EQ (((int64_t *) info.data)[i], (int64_t) (i + 1));
+      gst_buffer_unmap (out_buf, &info);
+      gst_buffer_unref (out_buf);
+
+      gst_harness_teardown (h);
+    }
+  }
+}
+
+/**
+ * @brief Test for tensor_transform, per-channel arithmetic producing float16
+ *        (item G4 of #4960).
+ */
+TEST (testTensorTransform, float16PerChannelArithmetic)
+{
+  const uint8_t in_values[] = { 1, 2, 3, 4 };
+  const uint16_t expected[] = { 0x4000, 0x4000, 0x4400, 0x4400 }; /* 2, 2, 4, 4 */
+  GstHarness *h;
+  GstBuffer *in_buf, *out_buf;
+  GstMapInfo info;
+  guint a, i;
+
+  for (a = 0; a < 2U; a++) {
+    h = _new_transform_static_harness (GTT_ARITHMETIC,
+        "typecast:float16,per-channel:true@0,add:1@0", (gboolean) a, _NNS_UINT8,
+        "2:2", FALSE);
+    ASSERT_TRUE (h != NULL);
+
+    in_buf = gst_harness_create_buffer (h, sizeof (in_values));
+    gst_buffer_fill (in_buf, 0, in_values, sizeof (in_values));
+
+    EXPECT_EQ (gst_harness_push (h, in_buf), GST_FLOW_OK);
+    out_buf = gst_harness_try_pull (h);
+    ASSERT_TRUE (out_buf != NULL);
+
+    ASSERT_TRUE (gst_buffer_map (out_buf, &info, GST_MAP_READ));
+    ASSERT_EQ (info.size, sizeof (expected));
+    for (i = 0; i < G_N_ELEMENTS (expected); i++)
+      EXPECT_EQ (((uint16_t *) info.data)[i], expected[i]);
+    gst_buffer_unmap (out_buf, &info);
+    gst_buffer_unref (out_buf);
+
+    gst_harness_teardown (h);
+  }
+}
+#endif /* FLOAT16_SUPPORT */
+
+/**
+ * @brief Push a uint32 tensor through the transpose mode and compare the
+ *        result with the reference permutation of the first three dimensions.
+ * @param dim_str dimension of the input tensor
+ * @param option transpose option, NEW_IDX_DIM0:NEW_IDX_DIM1:NEW_IDX_DIM2:3
+ * @param flex_in TRUE to push the tensor as a flexible one
+ */
+static void
+_test_transpose (const gchar *dim_str, const gchar *option, gboolean flex_in)
+{
+  GstHarness *h;
+  GstBuffer *in_buf, *out_buf;
+  GstTensorInfo in_info, out_info;
+  GstTensorMetaInfo meta;
+  GstCaps *caps;
+  GstMemory *mem;
+  GstMapInfo info;
+  uint32_t *in_data, *out_data, *dim, out_dim[3];
+  guint order[3], x[3], y[3];
+  gsize count, outer, block, l, in_idx, out_idx, hsize = 0;
+
+  ASSERT_EQ (sscanf (option, "%u:%u:%u:3", &order[0], &order[1], &order[2]), 3);
+
+  gst_tensor_info_init (&in_info);
+  in_info.type = _NNS_UINT32;
+  gst_tensor_parse_dimension (dim_str, in_info.dimension);
+  dim = in_info.dimension;
+  count = gst_tensor_get_element_count (dim);
+  ASSERT_GT (count, 0U);
+
+  if (flex_in) {
+    h = gst_harness_new ("tensor_transform");
+    ASSERT_TRUE (h != NULL);
+    g_object_set (h->element, "mode", GTT_TRANSPOSE, "option", option, NULL);
+
+    caps = gst_caps_from_string (GST_TENSORS_FLEX_CAP_DEFAULT);
+    gst_caps_set_simple (caps, "framerate", GST_TYPE_FRACTION, 0, 1, NULL);
+    gst_harness_set_src_caps (h, caps);
+
+    mem = _new_flex_typed_memory (_NNS_UINT32, dim_str, TRUE, 0U);
+    gst_tensor_info_convert_to_meta (&in_info, &meta);
+    hsize = gst_tensor_meta_info_get_header_size (&meta);
+    in_buf = gst_buffer_new ();
+    gst_buffer_append_memory (in_buf, mem);
+  } else {
+    h = _new_transform_static_harness (
+        GTT_TRANSPOSE, option, FALSE, _NNS_UINT32, dim_str, FALSE);
+    ASSERT_TRUE (h != NULL);
+    in_buf = gst_harness_create_buffer (h, count * sizeof (uint32_t));
+    mem = gst_buffer_peek_memory (in_buf, 0);
+  }
+
+  ASSERT_TRUE (gst_memory_map (mem, &info, GST_MAP_WRITE));
+  in_data = (uint32_t *) (info.data + hsize);
+  for (l = 0; l < count; l++)
+    in_data[l] = (uint32_t) l;
+  gst_memory_unmap (mem, &info);
+
+  EXPECT_EQ (gst_harness_push (h, in_buf), GST_FLOW_OK);
+  out_buf = gst_harness_try_pull (h);
+  ASSERT_TRUE (out_buf != NULL);
+  ASSERT_EQ (gst_buffer_n_memory (out_buf), 1U);
+
+  mem = gst_buffer_peek_memory (out_buf, 0);
+  ASSERT_TRUE (gst_memory_map (mem, &info, GST_MAP_READ));
+
+  /* the output dimension permutes the first three, the rest keep their place */
+  gst_tensor_info_init (&out_info);
+  if (flex_in) {
+    ASSERT_TRUE (gst_tensor_meta_info_parse_header (&meta, info.data));
+    ASSERT_TRUE (gst_tensor_meta_info_convert (&meta, &out_info));
+    hsize = gst_tensor_meta_info_get_header_size (&meta);
+  } else {
+    GstTensorsConfig config;
+
+    caps = gst_pad_get_current_caps (h->sinkpad);
+    ASSERT_TRUE (caps != NULL);
+    gst_tensors_config_init (&config);
+    ASSERT_TRUE (gst_tensors_config_from_structure (
+        &config, gst_caps_get_structure (caps, 0)));
+    gst_caps_unref (caps);
+    gst_tensor_info_copy (&out_info, &config.info.info[0]);
+    gst_tensors_config_free (&config);
+  }
+
+  for (l = 0; l < 3; l++) {
+    out_dim[l] = dim[order[l]];
+    EXPECT_EQ (out_info.dimension[l], out_dim[l]);
+  }
+  for (l = 3; l < NNS_TENSOR_RANK_LIMIT; l++)
+    EXPECT_EQ (out_info.dimension[l], dim[l]);
+
+  ASSERT_EQ (info.size, hsize + count * sizeof (uint32_t));
+  out_data = (uint32_t *) (info.data + hsize);
+
+  block = (gsize) dim[0] * dim[1] * dim[2];
+  outer = count / block;
+  for (l = 0; l < outer; l++) {
+    for (y[2] = 0; y[2] < out_dim[2]; y[2]++) {
+      for (y[1] = 0; y[1] < out_dim[1]; y[1]++) {
+        for (y[0] = 0; y[0] < out_dim[0]; y[0]++) {
+          x[order[0]] = y[0];
+          x[order[1]] = y[1];
+          x[order[2]] = y[2];
+          out_idx = y[0] + (gsize) out_dim[0] * (y[1] + (gsize) out_dim[1] * y[2]);
+          in_idx = x[0] + (gsize) dim[0] * (x[1] + (gsize) dim[1] * x[2]);
+          EXPECT_EQ (out_data[l * block + out_idx], (uint32_t) (l * block + in_idx));
+        }
+      }
+    }
+  }
+
+  gst_memory_unmap (mem, &info);
+  gst_buffer_unref (out_buf);
+  gst_tensor_info_free (&out_info);
+  gst_tensor_info_free (&in_info);
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Test for tensor_transform transpose of tensors up to rank 4, whose
+ *        output has to stay as it was before dimensions 4 and above were
+ *        transposed (item G8 of #4960).
+ */
+TEST (testTensorTransform, transposeRank4)
+{
+  const gchar *options[]
+      = { "0:1:2:3", "0:2:1:3", "1:0:2:3", "1:2:0:3", "2:0:1:3", "2:1:0:3" };
+  guint o, f;
+
+  for (o = 0; o < G_N_ELEMENTS (options); o++) {
+    for (f = 0; f < 2U; f++) {
+      _test_transpose ("2:3:4:5", options[o], (gboolean) f);
+      _test_transpose ("3:4:5", options[o], (gboolean) f);
+      _test_transpose ("3:4:5:1", options[o], (gboolean) f);
+    }
+  }
+}
+
+/**
+ * @brief Test for tensor_transform transpose of tensors above rank 4, whose
+ *        dimensions 4 and above used to be skipped, leaving the tail of the
+ *        output uninitialised (item G8 of #4960).
+ */
+TEST (testTensorTransform, transposeAboveRank4)
+{
+  const gchar *options[]
+      = { "0:1:2:3", "0:2:1:3", "1:0:2:3", "1:2:0:3", "2:0:1:3", "2:1:0:3" };
+  guint o, f;
+
+  for (o = 0; o < G_N_ELEMENTS (options); o++) {
+    for (f = 0; f < 2U; f++) {
+      _test_transpose ("2:3:4:5:6", options[o], (gboolean) f);
+      _test_transpose ("2:3:4:1:2:1:3", options[o], (gboolean) f);
+      _test_transpose ("2:3:2:1:1:1:1:1:1:1:1:1:1:1:1:2", options[o], (gboolean) f);
+    }
+  }
+}
+
+/**
+ * @brief Test for tensor_transform transpose of a rank-5 tensor holding only
+ *        the data of its first four dimensions (item G8 of #4960). The whole
+ *        rank is transposed, so the short buffer is refused.
+ */
+TEST (testTensorTransform, transposeAboveRank4Short_n)
+{
+  GstHarness *h;
+
+  h = _new_transform_static_harness (
+      GTT_TRANSPOSE, "1:0:2:3", FALSE, _NNS_UINT8, "2:3:4:5:6", FALSE);
+  ASSERT_TRUE (h != NULL);
+
+  EXPECT_EQ (_push_tensor_of_size (h, 2U * 3U * 4U * 5U), GST_FLOW_ERROR);
+  EXPECT_EQ (gst_harness_buffers_received (h), 0U);
+
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Test for tensor_transform transpose of a flexible rank-5 tensor whose
+ *        header declares more data than the memory holds (item G8 of #4960).
+ */
+TEST (testTensorTransform, transposeAboveRank4FlexibleShort_n)
+{
+  GstHarness *h;
+  GstBuffer *buf;
+  GstCaps *caps;
+  GstTensorMetaInfo meta;
+  GstTensorInfo info;
+
+  h = gst_harness_new ("tensor_transform");
+  ASSERT_TRUE (h != NULL);
+  g_object_set (h->element, "mode", GTT_TRANSPOSE, "option", "1:0:2:3", NULL);
+
+  caps = gst_caps_from_string (GST_TENSORS_FLEX_CAP_DEFAULT);
+  gst_caps_set_simple (caps, "framerate", GST_TYPE_FRACTION, 0, 1, NULL);
+  gst_harness_set_src_caps (h, caps);
+
+  gst_tensor_info_init (&info);
+  info.type = _NNS_UINT8;
+  gst_tensor_parse_dimension ("2:3:4:5:6", info.dimension);
+  gst_tensor_info_convert_to_meta (&info, &meta);
+
+  buf = gst_buffer_new ();
+  gst_buffer_append_memory (buf,
+      _new_flex_memory ("2:3:4:5:6", TRUE,
+          gst_tensor_meta_info_get_header_size (&meta) + 2U * 3U * 4U * 5U));
+
+  EXPECT_EQ (gst_harness_push (h, buf), GST_FLOW_ERROR);
+  EXPECT_EQ (gst_harness_buffers_received (h), 0U);
+
+  gst_tensor_info_free (&info);
   gst_harness_teardown (h);
 }
 
@@ -5042,11 +7094,10 @@ TEST (testTensorConverter, bytesToMultiInvalidType03_n)
 
   /* push buffers */
   in_buf = gst_harness_create_buffer (h, data_size);
-  EXPECT_DEATH (gst_harness_push (h, in_buf), "");
+  EXPECT_EQ (gst_harness_push (h, in_buf), GST_FLOW_ERROR);
 
   EXPECT_EQ (gst_harness_buffers_received (h), 0U);
 
-  gst_buffer_unref (in_buf);
   gst_harness_teardown (h);
 }
 
@@ -5084,11 +7135,10 @@ TEST (testTensorConverter, bytesToMultiInvalidSize_n)
 
   /* push buffers */
   in_buf = gst_harness_create_buffer (h, data_size);
-  EXPECT_DEATH (gst_harness_push (h, in_buf), "");
+  EXPECT_EQ (gst_harness_push (h, in_buf), GST_FLOW_ERROR);
 
   EXPECT_EQ (gst_harness_buffers_received (h), 0U);
 
-  gst_buffer_unref (in_buf);
   gst_harness_teardown (h);
 }
 
@@ -7891,6 +9941,78 @@ TEST_F (testTensorFilterCppSubplugin, openCloseOwnership_p)
 }
 
 /**
+ * @brief Number of tensors the async output callback of a test has received.
+ */
+static guint dispatch_async_received;
+
+/**
+ * @brief Async output callback that takes and releases what it is handed.
+ */
+static int
+_dispatch_async_cb (GstTensorMemory *data, GstTensorsInfo *info, void *user_data)
+{
+  guint i;
+
+  for (i = 0; i < info->num_tensors; i++) {
+    if (data[i].data)
+      dispatch_async_received++;
+    g_clear_pointer (&data[i].data, g_free);
+  }
+
+  return 0;
+}
+
+/**
+ * @brief Async output goes to the registered callback, which owns it.
+ */
+TEST (testTensorFilterAsync, dispatchToCallback)
+{
+  GstTensorFilterProperties prop;
+  GstTensorMemory output[2];
+
+  memset (&prop, 0, sizeof (prop));
+  gst_tensors_info_init (&prop.output_meta);
+  prop.output_meta.num_tensors = 2;
+  prop.async_callback = _dispatch_async_cb;
+
+  output[0].size = 4;
+  output[0].data = g_malloc0 (output[0].size);
+  output[1].size = 8;
+  output[1].data = g_malloc0 (output[1].size);
+
+  dispatch_async_received = 0;
+  nnstreamer_filter_dispatch_output_async (&prop, output);
+  EXPECT_EQ (dispatch_async_received, 2U);
+
+  gst_tensors_info_free (&prop.output_meta);
+}
+
+/**
+ * @brief Async output dispatched with no callback registered, as it is once
+ *        tensor-filter has stopped, is released rather than dropped.
+ */
+TEST (testTensorFilterAsync, dispatchWithoutCallback_n)
+{
+  GstTensorFilterProperties prop;
+  GstTensorMemory output[2];
+
+  memset (&prop, 0, sizeof (prop));
+  gst_tensors_info_init (&prop.output_meta);
+  prop.output_meta.num_tensors = 2;
+
+  output[0].size = 4;
+  output[0].data = g_malloc0 (output[0].size);
+  output[1].size = 8;
+  output[1].data = g_malloc0 (output[1].size);
+
+  nnstreamer_filter_dispatch_output_async (&prop, output);
+  EXPECT_TRUE (output[0].data == NULL);
+  EXPECT_TRUE (output[1].data == NULL);
+
+  gst_tensors_info_free (&prop.output_meta);
+}
+
+/**
  * @brief Test to reload tf-lite model set_property of model/is-updatable
  */
 TEST_REQUIRE_TFLITE (testTensorFilter, reloadTFliteSetProperty)
@@ -9864,14 +11986,13 @@ _crop_test_free (crop_test_data_s *crop_test)
   } while (0)
 
 /**
- * @brief Push raw and info buffer to tensor_crop.
+ * @brief Set the raw-pad caps of tensor_crop.
  */
 static void
-_crop_test_push_buffer (crop_test_data_s *crop_test)
+_crop_test_set_raw_caps (crop_test_data_s *crop_test)
 {
   GstTensorsConfig config;
 
-  /* caps for raw data */
   gst_tensors_config_init (&config);
   config.info.num_tensors = 1;
   config.info.info[0] = crop_test->raw_info;
@@ -9880,6 +12001,131 @@ _crop_test_push_buffer (crop_test_data_s *crop_test)
   config.rate_d = 1;
 
   gst_harness_set_src_caps (crop_test->raw_q, gst_tensors_caps_from_config (&config));
+}
+
+/**
+ * @brief Push a buffer of two memories to the given pad.
+ */
+static void
+_crop_test_push_two_memories (GstHarness *h, gsize first, gsize second)
+{
+  GstBuffer *buf = gst_buffer_new ();
+
+  gst_buffer_append_memory (buf, gst_allocator_alloc (NULL, first, NULL));
+  gst_buffer_append_memory (buf, gst_allocator_alloc (NULL, second, NULL));
+  /* an element that sniffs a header must not branch on uninitialised bytes */
+  gst_buffer_memset (buf, 0, 0, gst_buffer_get_size (buf));
+
+  EXPECT_EQ (gst_harness_push (h, buf), GST_FLOW_OK);
+}
+
+/**
+ * @brief Release the mapping of a memory from _crop_test_new_guarded_memory().
+ */
+static void
+_crop_test_unmap_guarded (gpointer base)
+{
+  munmap (base, 2 * (gsize) sysconf (_SC_PAGESIZE));
+}
+
+/**
+ * @brief Create a memory of @a size bytes that is followed by an unreadable page.
+ * @details Reading a single byte past the memory faults, which turns an
+ *          out-of-bounds read into a deterministic failure without valgrind.
+ *          When @a src is not NULL, @a size bytes are copied into the memory.
+ * @note @a size cannot exceed the page size, the memory ends on a page boundary.
+ * @return The memory, or NULL when the guarded mapping is not available.
+ */
+static GstMemory *
+_crop_test_new_guarded_memory (gsize size, const void *src)
+{
+  const gsize page = (gsize) sysconf (_SC_PAGESIZE);
+  guint8 *base;
+
+  if (size > page)
+    return NULL;
+
+  base = (guint8 *) mmap (NULL, 2 * page, PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (base == MAP_FAILED)
+    return NULL;
+
+  if (src != NULL)
+    memcpy (base + page - size, src, size);
+
+  if (mprotect (base + page, page, PROT_NONE) != 0) {
+    munmap (base, 2 * page);
+    return NULL;
+  }
+
+  return gst_memory_new_wrapped (GST_MEMORY_FLAG_READONLY, base + page - size,
+      size, 0, size, base, _crop_test_unmap_guarded);
+}
+
+/**
+ * @brief Push a buffer whose first memory is followed by an unreadable page.
+ * @return TRUE if the guarded memory could be built; a push that is refused is
+ *         reported by the expectation below, which names the flow return.
+ */
+static gboolean
+_crop_test_push_guarded_memory (GstHarness *h, gsize size)
+{
+  GstBuffer *buf;
+  GstFlowReturn ret;
+  gpointer filler;
+  GstMemory *mem = _crop_test_new_guarded_memory (size, NULL);
+
+  if (!mem)
+    return FALSE;
+
+  buf = gst_buffer_new ();
+  gst_buffer_append_memory (buf, mem);
+  /**
+   * The second memory keeps gst_tensor_buffer_from_config() from re-splitting.
+   * It is zeroed because an element that sniffs a header must not branch on
+   * uninitialised bytes; the guarded one is an anonymous mapping, so the kernel
+   * has already zeroed it, and it is read-only anyway.
+   */
+  filler = g_malloc0 (size);
+  gst_buffer_append_memory (buf, gst_memory_new_wrapped ((GstMemoryFlags) 0,
+                                     filler, size, 0, size, filler, g_free));
+
+  ret = gst_harness_push (h, buf);
+  EXPECT_EQ (ret, GST_FLOW_OK) << gst_flow_get_name (ret);
+  return TRUE;
+}
+
+/**
+ * @brief Push an info buffer carrying a flex tensor of the given dimension.
+ */
+static void
+_crop_test_push_info_dimension (crop_test_data_s *crop_test, guint d0, guint d1)
+{
+  GstBuffer *buf = gst_buffer_new ();
+  GstMemory *mem;
+  GstTensorMetaInfo meta;
+
+  gst_tensor_meta_info_init (&meta);
+  meta.type = crop_test->info_type;
+  meta.dimension[0] = d0;
+  meta.dimension[1] = d1;
+  meta.format = _NNS_TENSOR_FORMAT_FLEXIBLE;
+
+  mem = gst_memory_new_wrapped (GST_MEMORY_FLAG_READONLY, crop_test->info_data,
+      crop_test->info_size, 0, crop_test->info_size, NULL, NULL);
+  gst_buffer_append_memory (buf, gst_tensor_meta_info_append_header (&meta, mem));
+  gst_memory_unref (mem);
+
+  EXPECT_EQ (gst_harness_push (crop_test->info_q, buf), GST_FLOW_OK);
+}
+
+/**
+ * @brief Push raw and info buffer to tensor_crop.
+ */
+static void
+_crop_test_push_buffer (crop_test_data_s *crop_test)
+{
+  _crop_test_set_raw_caps (crop_test);
 
   /* push raw buffer */
   _crop_test_push_raw_buffer (crop_test, crop_test->ts_raw);
@@ -10310,6 +12556,655 @@ TEST (testTensorCrop, infoDelayed_n)
   if (crop_test.received > 0)
     _crop_test_compare_res2 (&crop_test);
 
+  _crop_test_free (&crop_test);
+}
+
+/**
+ * @brief Prepare the raw data (uint32 1:10:4:1, [1, 2, ..., 40]) and one region.
+ */
+static void
+_crop_test_prepare_single_region (crop_test_data_s *crop_test)
+{
+  guint i;
+  guint *_data;
+
+  crop_test->raw_info.type = _NNS_UINT32;
+  gst_tensor_parse_dimension ("1:10:4:1", crop_test->raw_info.dimension);
+
+  crop_test->raw_size = sizeof (guint) * 40U;
+  crop_test->raw_data = g_malloc0 (crop_test->raw_size);
+  _data = (guint *) crop_test->raw_data;
+
+  for (i = 0; i < 40; i++)
+    _data[i] = i + 1;
+
+  crop_test->info_type = _NNS_UINT32;
+  crop_test->info_size = sizeof (guint) * 4U;
+  crop_test->info_num = 1U;
+  crop_test->info_data = g_malloc0 (crop_test->info_size);
+}
+
+/**
+ * @brief Set the single crop region [x, y, w, h].
+ */
+static void
+_crop_test_set_region (crop_test_data_s *crop_test, guint x, guint y, guint w, guint h)
+{
+  guint *_info = (guint *) crop_test->info_data;
+
+  _info[0] = x;
+  _info[1] = y;
+  _info[2] = w;
+  _info[3] = h;
+}
+
+/**
+ * @brief Check the single cropped tensor against the expected elements.
+ */
+static void
+_crop_test_compare_single (crop_test_data_s *crop_test, guint width,
+    guint height, const guint *expected)
+{
+  GstBuffer *out_buf;
+  GstMemory *mem;
+  GstMapInfo map;
+  GstTensorMetaInfo meta;
+  gsize hsize;
+  guint i;
+  guint *cropped;
+
+  out_buf = gst_harness_pull (crop_test->crop);
+  ASSERT_EQ (gst_buffer_n_memory (out_buf), 1U);
+
+  mem = gst_buffer_peek_memory (out_buf, 0);
+  ASSERT_TRUE (gst_memory_map (mem, &map, GST_MAP_READ));
+
+  ASSERT_TRUE (gst_tensor_meta_info_parse_header (&meta, map.data));
+  EXPECT_EQ (meta.dimension[0], 1U);
+  EXPECT_EQ (meta.dimension[1], width);
+  EXPECT_EQ (meta.dimension[2], height);
+
+  hsize = gst_tensor_meta_info_get_header_size (&meta);
+  cropped = (guint *) (map.data + hsize);
+  EXPECT_EQ (map.size - hsize, sizeof (guint) * width * height);
+
+  for (i = 0; i < width * height; i++)
+    EXPECT_EQ (cropped[i], expected[i]);
+
+  gst_memory_unmap (mem, &map);
+  gst_buffer_unref (out_buf);
+}
+
+/**
+ * @brief Wait for tensor_crop to handle the pushed buffers, expecting no more
+ *        output than @a baseline buffers.
+ * @details The harness pushes into a queue, so the element runs on the queue's
+ *          streaming thread and the count is not final when the push returns;
+ *          checking it once would report "has not run yet" as "produced
+ *          nothing". There is nothing to wait for in a case that expects no
+ *          new buffer, so the budget is a short one - a regressed element
+ *          crashes in its chain function rather than producing a late buffer.
+ *          @a baseline is the number of buffers cropped before this wait.
+ */
+static guint
+_crop_test_wait_for_no_output (crop_test_data_s *crop_test, guint baseline)
+{
+  guint count;
+
+  for (count = 0; count < 5; count++) {
+    g_usleep (100000);
+    if (gst_harness_buffers_received (crop_test->crop) > baseline)
+      break;
+  }
+
+  return gst_harness_buffers_received (crop_test->crop);
+}
+
+/**
+ * @brief Test for tensor_crop, a region wider than the frame is clamped.
+ * @details Without the fix the width is kept as it is, because the bounds test
+ *          'x + w - 1 < width' wraps around in 32-bit arithmetic.
+ */
+TEST (testTensorCrop, cropRegionWidthOverflow)
+{
+  crop_test_data_s crop_test;
+  const guint expected[] = { 3U, 4U, 5U, 6U, 7U, 8U, 9U, 10U };
+
+  _crop_test_init (&crop_test);
+  _crop_test_prepare_single_region (&crop_test);
+
+  /* the width wraps 'x + w - 1' to 0 */
+  _crop_test_set_region (&crop_test, 2U, 0U, G_MAXUINT32, 1U);
+
+  _crop_test_push_buffer (&crop_test);
+  EXPECT_EQ (crop_test.received, 1U);
+
+  if (crop_test.received > 0)
+    _crop_test_compare_single (&crop_test, 8U, 1U, expected);
+
+  _crop_test_free (&crop_test);
+}
+
+/**
+ * @brief Test for tensor_crop, a region taller than the frame is clamped.
+ * @details Without the fix the height is kept as it is, because the bounds test
+ *          'y + h - 1 < height' wraps around in 32-bit arithmetic.
+ */
+TEST (testTensorCrop, cropRegionHeightOverflow)
+{
+  crop_test_data_s crop_test;
+  const guint expected[] = { 21U, 31U };
+
+  _crop_test_init (&crop_test);
+  _crop_test_prepare_single_region (&crop_test);
+
+  /* the height wraps 'y + h - 1' to 0 */
+  _crop_test_set_region (&crop_test, 0U, 2U, 1U, G_MAXUINT32);
+
+  _crop_test_push_buffer (&crop_test);
+  EXPECT_EQ (crop_test.received, 1U);
+
+  if (crop_test.received > 0)
+    _crop_test_compare_single (&crop_test, 1U, 2U, expected);
+
+  _crop_test_free (&crop_test);
+}
+
+/**
+ * @brief Test for tensor_crop, a region of zero width crops the rest of the row.
+ * @details Without the fix the clamped width is 0 and the element aborts, unless
+ *          the region also starts at 0, which the tensor_region decoder relies on.
+ */
+TEST (testTensorCrop, cropRegionZeroWidth)
+{
+  crop_test_data_s crop_test;
+  const guint expected[] = { 4U, 5U, 6U, 7U, 8U, 9U, 10U };
+
+  _crop_test_init (&crop_test);
+  _crop_test_prepare_single_region (&crop_test);
+
+  _crop_test_set_region (&crop_test, 3U, 0U, 0U, 1U);
+
+  _crop_test_push_buffer (&crop_test);
+  EXPECT_EQ (crop_test.received, 1U);
+
+  if (crop_test.received > 0)
+    _crop_test_compare_single (&crop_test, 7U, 1U, expected);
+
+  _crop_test_free (&crop_test);
+}
+
+/**
+ * @brief Test for tensor_crop, an all-zero region crops the whole frame.
+ * @details The tensor_region decoder zero-fills the crop-info slots it has no
+ *          detection for, so this is what a pipeline of it emits every time
+ *          there are fewer detections than 'option1' asks for.
+ */
+TEST (testTensorCrop, cropRegionZeroIsWholeFrame)
+{
+  crop_test_data_s crop_test;
+  GstBuffer *out_buf;
+  guint i;
+  guint *_info;
+
+  _crop_test_init (&crop_test);
+  _crop_test_prepare_single_region (&crop_test);
+
+  /* one detected region and one the decoder left empty */
+  crop_test.info_size = sizeof (guint) * 8U;
+  crop_test.info_num = 2U;
+  g_free (crop_test.info_data);
+  crop_test.info_data = g_malloc0 (crop_test.info_size);
+  _info = (guint *) crop_test.info_data;
+  _info[0] = 3U;
+  _info[1] = 0U;
+  _info[2] = 3U;
+  _info[3] = 1U;
+
+  _crop_test_push_buffer (&crop_test);
+  ASSERT_EQ (crop_test.received, 1U);
+
+  out_buf = gst_harness_pull (crop_test.crop);
+  ASSERT_EQ (gst_buffer_n_memory (out_buf), 2U);
+
+  for (i = 0; i < 2U; i++) {
+    GstMemory *mem = gst_buffer_peek_memory (out_buf, i);
+    GstMapInfo map;
+    GstTensorMetaInfo meta;
+    gsize hsize;
+    guint j, elements;
+    guint *cropped;
+
+    ASSERT_TRUE (gst_memory_map (mem, &map, GST_MAP_READ));
+    ASSERT_TRUE (gst_tensor_meta_info_parse_header (&meta, map.data));
+    EXPECT_EQ (meta.dimension[1], (i == 0) ? 3U : 10U);
+    EXPECT_EQ (meta.dimension[2], (i == 0) ? 1U : 4U);
+
+    hsize = gst_tensor_meta_info_get_header_size (&meta);
+    cropped = (guint *) (map.data + hsize);
+    elements = (i == 0) ? 3U : 40U;
+    EXPECT_EQ (map.size - hsize, sizeof (guint) * elements);
+
+    /* [4, 5, 6] for the detected region, the whole [1, 2, ..., 40] for the empty one */
+    for (j = 0; j < elements; j++)
+      EXPECT_EQ (cropped[j], (i == 0) ? j + 4U : j + 1U);
+
+    gst_memory_unmap (mem, &map);
+  }
+
+  gst_buffer_unref (out_buf);
+  _crop_test_free (&crop_test);
+}
+
+/**
+ * @brief Test for tensor_crop, one unusable region does not drop the others.
+ * @details The unusable region sits between two usable ones, so the case pins
+ *          that the loop goes on past a skip, that what came before the skip is
+ *          kept, and that the survivors keep their order.
+ */
+TEST (testTensorCrop, cropRegionPartiallyOutOfFrame)
+{
+  crop_test_data_s crop_test;
+  const guint expected0[] = { 4U, 5U, 6U };
+  const guint expected1[] = { 22U, 23U, 32U, 33U };
+  const guint regions[] = {
+    3U, 0U, 3U, 1U, /* usable */
+    10U, 0U, 2U, 1U, /* starts past the right edge of the 10-wide frame */
+    1U, 2U, 2U, 2U, /* usable */
+  };
+  GstBuffer *out_buf;
+  guint i, j;
+
+  _crop_test_init (&crop_test);
+  _crop_test_prepare_single_region (&crop_test);
+
+  crop_test.info_size = sizeof (regions);
+  crop_test.info_num = 3U;
+  g_free (crop_test.info_data);
+  crop_test.info_data = _g_memdup (regions, sizeof (regions));
+
+  _crop_test_push_buffer (&crop_test);
+  ASSERT_EQ (crop_test.received, 1U);
+
+  out_buf = gst_harness_pull (crop_test.crop);
+  ASSERT_EQ (gst_buffer_n_memory (out_buf), 2U);
+
+  for (i = 0; i < 2U; i++) {
+    GstMemory *mem = gst_buffer_peek_memory (out_buf, i);
+    const guint *expected = (i == 0) ? expected0 : expected1;
+    const guint width = (i == 0) ? 3U : 2U;
+    const guint height = (i == 0) ? 1U : 2U;
+    GstMapInfo map;
+    GstTensorMetaInfo meta;
+    gsize hsize;
+    guint *cropped;
+
+    ASSERT_TRUE (gst_memory_map (mem, &map, GST_MAP_READ));
+    ASSERT_TRUE (gst_tensor_meta_info_parse_header (&meta, map.data));
+    EXPECT_EQ (meta.dimension[1], width);
+    EXPECT_EQ (meta.dimension[2], height);
+
+    hsize = gst_tensor_meta_info_get_header_size (&meta);
+    cropped = (guint *) (map.data + hsize);
+    EXPECT_EQ (map.size - hsize, sizeof (guint) * width * height);
+
+    for (j = 0; j < width * height; j++)
+      EXPECT_EQ (cropped[j], expected[j]);
+
+    gst_memory_unmap (mem, &map);
+  }
+
+  gst_buffer_unref (out_buf);
+  _crop_test_free (&crop_test);
+}
+
+/**
+ * @brief Test for tensor_crop, a region starting outside the frame is skipped.
+ * @details Without the fix the clamped width is 0 and the element aborts; here
+ *          it is the only region, so the buffer as a whole has nothing to crop.
+ */
+TEST (testTensorCrop, cropRegionOutOfFrame_n)
+{
+  crop_test_data_s crop_test;
+
+  _crop_test_init (&crop_test);
+  _crop_test_prepare_single_region (&crop_test);
+
+  /* the raw data is 10 wide */
+  _crop_test_set_region (&crop_test, 10U, 0U, 2U, 1U);
+
+  _crop_test_set_raw_caps (&crop_test);
+  _crop_test_push_raw_buffer (&crop_test, crop_test.ts_raw);
+  _crop_test_push_info_buffer (&crop_test, crop_test.ts_info);
+  crop_test.received = _crop_test_wait_for_no_output (&crop_test, 0U);
+  EXPECT_EQ (crop_test.received, 0U);
+
+  _crop_test_free (&crop_test);
+}
+
+/**
+ * @brief Test for tensor_crop, a buffer it cannot crop posts an element error.
+ * @details The chain function returns GST_FLOW_ERROR when nothing can be
+ *          cropped, and it must post GST_ELEMENT_ERROR so the reason reaches
+ *          the bus rather than only the debug log.
+ */
+TEST (testTensorCrop, cropChainPostsBusError_n)
+{
+  crop_test_data_s crop_test;
+  GstBus *bus;
+  GstMessage *msg;
+
+  _crop_test_init (&crop_test);
+  _crop_test_prepare_single_region (&crop_test);
+
+  /* the only region starts past the right edge of the 10-wide frame */
+  _crop_test_set_region (&crop_test, 10U, 0U, 2U, 1U);
+
+  bus = gst_bus_new ();
+  gst_element_set_bus (crop_test.crop->element, bus);
+
+  _crop_test_set_raw_caps (&crop_test);
+  _crop_test_push_raw_buffer (&crop_test, crop_test.ts_raw);
+  _crop_test_push_info_buffer (&crop_test, crop_test.ts_info);
+
+  msg = gst_bus_timed_pop_filtered (bus, 2 * GST_SECOND, GST_MESSAGE_ERROR);
+  EXPECT_TRUE (msg != NULL);
+  if (msg)
+    gst_message_unref (msg);
+
+  gst_element_set_bus (crop_test.crop->element, NULL);
+  gst_object_unref (bus);
+  _crop_test_free (&crop_test);
+}
+
+/**
+ * @brief Test for tensor_crop, an info tensor that does not hold whole regions.
+ * @details Without the fix the element aborts on the element-count assertion.
+ */
+TEST (testTensorCrop, cropInfoElementCount_n)
+{
+  crop_test_data_s crop_test;
+
+  _crop_test_init (&crop_test);
+  _crop_test_prepare_single_region (&crop_test);
+
+  crop_test.info_size = sizeof (guint) * 3U;
+
+  _crop_test_set_raw_caps (&crop_test);
+  _crop_test_push_raw_buffer (&crop_test, crop_test.ts_raw);
+  _crop_test_push_info_dimension (&crop_test, 3U, 1U);
+
+  crop_test.received = _crop_test_wait_for_no_output (&crop_test, 0U);
+  EXPECT_EQ (crop_test.received, 0U);
+
+  _crop_test_free (&crop_test);
+}
+
+/**
+ * @brief Test for tensor_crop, an info memory smaller than the meta header.
+ * @details Without the fix the header is parsed past the end of the memory.
+ */
+TEST (testTensorCrop, cropInfoShortHeader_n)
+{
+  crop_test_data_s crop_test;
+
+  _crop_test_init (&crop_test);
+  _crop_test_prepare_single_region (&crop_test);
+
+  _crop_test_set_raw_caps (&crop_test);
+  _crop_test_push_raw_buffer (&crop_test, crop_test.ts_raw);
+  ASSERT_TRUE (_crop_test_push_guarded_memory (crop_test.info_q, 16U));
+
+  crop_test.received = _crop_test_wait_for_no_output (&crop_test, 0U);
+  EXPECT_EQ (crop_test.received, 0U);
+
+  _crop_test_free (&crop_test);
+}
+
+/**
+ * @brief Test for tensor_crop, a raw memory smaller than the meta header.
+ * @details Without the fix the header is parsed past the end of the memory.
+ */
+TEST (testTensorCrop, cropRawShortHeader_n)
+{
+  crop_test_data_s crop_test;
+
+  _crop_test_init (&crop_test);
+  _crop_test_prepare_single_region (&crop_test);
+  _crop_test_set_region (&crop_test, 0U, 0U, 1U, 1U);
+
+  crop_test.raw_format = _NNS_TENSOR_FORMAT_FLEXIBLE;
+
+  _crop_test_set_raw_caps (&crop_test);
+  ASSERT_TRUE (_crop_test_push_guarded_memory (crop_test.raw_q, 16U));
+  _crop_test_push_info_buffer (&crop_test, crop_test.ts_info);
+
+  crop_test.received = _crop_test_wait_for_no_output (&crop_test, 0U);
+  EXPECT_EQ (crop_test.received, 0U);
+
+  _crop_test_free (&crop_test);
+}
+
+/**
+ * @brief Test for tensor_crop, a raw header whose dimensions overflow.
+ * @details The byte size of 65536:65536:65536:65536 wraps to 0 modulo 2^64, so
+ *          without an overflow-checked size a header-only buffer passes the size
+ *          check and the copy reads far past the mapping; the guarded page makes
+ *          that a deterministic fault.
+ */
+TEST (testTensorCrop, cropRawDimensionOverflow_n)
+{
+  crop_test_data_s crop_test;
+  GstTensorMetaInfo meta;
+  GstBuffer *buf;
+  GstMemory *mem;
+  gpointer filler;
+  guint8 header[128] = { 0 };
+
+  _crop_test_init (&crop_test);
+  _crop_test_prepare_single_region (&crop_test);
+  _crop_test_set_region (&crop_test, 0U, 0U, 1U, 1U);
+  crop_test.raw_format = _NNS_TENSOR_FORMAT_FLEXIBLE;
+
+  /* a valid v1 header declaring uint8 65536:65536:65536:65536 */
+  gst_tensor_meta_info_init (&meta);
+  meta.type = _NNS_UINT8;
+  meta.dimension[0] = 65536U;
+  meta.dimension[1] = 65536U;
+  meta.dimension[2] = 65536U;
+  meta.dimension[3] = 65536U;
+  meta.format = _NNS_TENSOR_FORMAT_FLEXIBLE;
+  ASSERT_EQ (gst_tensor_meta_info_get_header_size (&meta), sizeof (header));
+  gst_tensor_meta_info_update_header (&meta, header);
+
+  mem = _crop_test_new_guarded_memory (sizeof (header), header);
+  ASSERT_TRUE (mem != NULL);
+  buf = gst_buffer_new ();
+  gst_buffer_append_memory (buf, mem);
+  /**
+   * The second memory keeps gst_tensor_buffer_from_config() from re-splitting.
+   * It is a zeroed g_malloc0 wrap rather than gst_buffer_memset(), which would
+   * make the whole buffer writable and copy the read-only guarded memory into a
+   * plain allocation, dropping the guard page the over-read has to hit.
+   */
+  filler = g_malloc0 (sizeof (header));
+  gst_buffer_append_memory (buf, gst_memory_new_wrapped ((GstMemoryFlags) 0, filler,
+                                     sizeof (header), 0, sizeof (header), filler, g_free));
+
+  _crop_test_set_raw_caps (&crop_test);
+  ASSERT_EQ (gst_harness_push (crop_test.raw_q, buf), GST_FLOW_OK);
+  _crop_test_push_info_buffer (&crop_test, crop_test.ts_info);
+
+  crop_test.received = _crop_test_wait_for_no_output (&crop_test, 0U);
+  EXPECT_EQ (crop_test.received, 0U);
+
+  _crop_test_free (&crop_test);
+}
+
+/**
+ * @brief Test for tensor_crop, a raw buffer that does not match the caps.
+ * @details gst_tensor_buffer_from_config() returns NULL for it; without the fix
+ *          the element reads the timestamp of that NULL buffer.
+ */
+TEST (testTensorCrop, cropRawConfigMismatch_n)
+{
+  crop_test_data_s crop_test;
+
+  _crop_test_init (&crop_test);
+  _crop_test_prepare_single_region (&crop_test);
+  _crop_test_set_region (&crop_test, 0U, 0U, 1U, 1U);
+
+  /* the timestamp of the buffer is read only while lateness is set */
+  g_object_set (crop_test.crop->element, "lateness", 100, NULL);
+
+  _crop_test_set_raw_caps (&crop_test);
+  _crop_test_push_two_memories (crop_test.raw_q, 16U, 16U);
+  _crop_test_push_info_buffer (&crop_test, crop_test.ts_info);
+
+  crop_test.received = _crop_test_wait_for_no_output (&crop_test, 0U);
+  EXPECT_EQ (crop_test.received, 0U);
+
+  _crop_test_free (&crop_test);
+}
+
+/* set by _crop_record_critical() when a critical is logged */
+static gboolean tensor_crop_logged_critical;
+
+/**
+ * @brief Log handler that records whether a critical was issued.
+ */
+static void
+_crop_record_critical (const gchar *domain, GLogLevelFlags level,
+    const gchar *message, gpointer user_data)
+{
+  UNUSED (domain);
+  UNUSED (message);
+  UNUSED (user_data);
+
+  if (level & G_LOG_LEVEL_CRITICAL)
+    tensor_crop_logged_critical = TRUE;
+}
+
+/**
+ * @brief Test for tensor_crop, a buffer that cannot be cropped is not pushed.
+ * @details Without the fix the NULL result of the cropping is handed to
+ *          gst_pad_push(), which rejects it with a critical.
+ */
+TEST (testTensorCrop, cropNoResultBuffer_n)
+{
+  crop_test_data_s crop_test;
+  guint handler_id;
+
+  _crop_test_init (&crop_test);
+
+  crop_test.raw_info.type = _NNS_UINT32;
+  gst_tensor_parse_dimension ("20:1:1:1", crop_test.raw_info.dimension);
+
+  /* the raw buffer is smaller than the caps describe */
+  crop_test.raw_size = sizeof (guint) * 10U;
+  crop_test.raw_data = g_malloc0 (crop_test.raw_size);
+
+  crop_test.info_type = _NNS_UINT32;
+  crop_test.info_size = sizeof (guint) * 4U;
+  crop_test.info_num = 1U;
+  crop_test.info_data = g_malloc0 (crop_test.info_size);
+  _crop_test_set_region (&crop_test, 0U, 0U, 1U, 1U);
+
+  tensor_crop_logged_critical = FALSE;
+  handler_id = g_log_set_handler ("GStreamer",
+      (GLogLevelFlags) (G_LOG_LEVEL_CRITICAL | G_LOG_FLAG_FATAL | G_LOG_FLAG_RECURSION),
+      _crop_record_critical, NULL);
+
+  /* the assertion below says nothing unless the handler is live */
+  g_log ("GStreamer", G_LOG_LEVEL_CRITICAL, "tensor_crop test probe");
+  EXPECT_TRUE (tensor_crop_logged_critical);
+  tensor_crop_logged_critical = FALSE;
+
+  _crop_test_set_raw_caps (&crop_test);
+  _crop_test_push_raw_buffer (&crop_test, crop_test.ts_raw);
+  _crop_test_push_info_buffer (&crop_test, crop_test.ts_info);
+  crop_test.received = _crop_test_wait_for_no_output (&crop_test, 0U);
+  g_log_remove_handler ("GStreamer", handler_id);
+
+  EXPECT_EQ (crop_test.received, 0U);
+  EXPECT_FALSE (tensor_crop_logged_critical);
+
+  _crop_test_free (&crop_test);
+}
+
+/**
+ * @brief Drop the CAPS sticky event of a pad, as if it had never been negotiated.
+ */
+static gboolean
+_crop_test_drop_caps (GstPad *pad, GstEvent **event, gpointer user_data)
+{
+  UNUSED (pad);
+  UNUSED (user_data);
+
+  if (GST_EVENT_TYPE (*event) == GST_EVENT_CAPS) {
+    gst_event_unref (*event);
+    *event = NULL;
+  }
+
+  return TRUE;
+}
+
+/**
+ * @brief Test for tensor_crop, a raw pad that has lost its caps is refused quietly.
+ * @details gst_tensor_crop_negotiate() checks the raw pad caps before every
+ *          buffer, so the cropping is never reached without them. Should that
+ *          check go, the output meta still has to refuse a NULL caps on its own,
+ *          without a critical.
+ */
+TEST (testTensorCrop, cropRawPadLosesCaps_n)
+{
+  crop_test_data_s crop_test;
+  GstPad *raw;
+  GstCaps *caps;
+  guint handler_id;
+
+  _crop_test_init (&crop_test);
+  _crop_test_prepare_single_region (&crop_test);
+  _crop_test_set_region (&crop_test, 0U, 0U, 1U, 1U);
+
+  /* crop once, so that every pad has been negotiated */
+  _crop_test_push_buffer (&crop_test);
+  ASSERT_EQ (crop_test.received, 1U);
+
+  raw = gst_element_get_static_pad (crop_test.crop->element, "raw");
+  ASSERT_TRUE (raw != NULL);
+  gst_pad_sticky_events_foreach (raw, _crop_test_drop_caps, NULL);
+  caps = gst_pad_get_current_caps (raw);
+  EXPECT_TRUE (caps == NULL);
+  if (caps)
+    gst_caps_unref (caps);
+
+  tensor_crop_logged_critical = FALSE;
+  handler_id = g_log_set_handler ("GStreamer",
+      (GLogLevelFlags) (G_LOG_LEVEL_CRITICAL | G_LOG_FLAG_FATAL | G_LOG_FLAG_RECURSION),
+      _crop_record_critical, NULL);
+
+  /* the assertion below says nothing unless the handler is live */
+  g_log ("GStreamer", G_LOG_LEVEL_CRITICAL, "tensor_crop test probe");
+  EXPECT_TRUE (tensor_crop_logged_critical);
+  tensor_crop_logged_critical = FALSE;
+
+  _crop_test_push_raw_buffer (&crop_test, crop_test.ts_raw);
+  _crop_test_push_info_buffer (&crop_test, crop_test.ts_info);
+  /* the second pair must not produce a buffer beyond the first */
+  crop_test.received = _crop_test_wait_for_no_output (&crop_test, 1U);
+  g_log_remove_handler ("GStreamer", handler_id);
+
+  EXPECT_EQ (crop_test.received, 1U);
+  EXPECT_FALSE (tensor_crop_logged_critical);
+
+  /**
+   * The refused pair is still held by the collect pads, with a queue thread
+   * waiting on it. Stop the element before the queues, the way a bin shuts a
+   * pipeline down from the sink side; the other way round the teardown hangs.
+   */
+  gst_element_set_state (crop_test.crop->element, GST_STATE_NULL);
+  gst_object_unref (raw);
   _crop_test_free (&crop_test);
 }
 
@@ -11505,15 +14400,15 @@ TEST (testTensorSparse, decUnnegotiatedPipeline_n)
 #define SPARSE_EXTRA_TENSORS_NUM (18U)
 
 /**
- * @brief Create a sparse tensor memory as long as the dense tensor it encodes.
- * @details Four non-zero elements of 40 int32 encode into 128 + 4 * 8 bytes,
- * exactly the 160 bytes the static tensor info declares. The two sizes have to
- * agree because gst_tensor_buffer_append_memory() records only the dense size
- * of an extra tensor, which truncates a longer sparse memory (item A6 of #4920,
- * issue #4934).
+ * @brief Create a sparse tensor memory of 40 int32, of which every @a stride-th
+ *        element is non-zero.
+ * @details With a stride of 10 the four non-zero elements encode into
+ * 128 + 4 * 8 bytes, exactly the 160 bytes the dense tensor info declares; a
+ * larger stride encodes into fewer bytes than that, which is what an extra
+ * tensor of such a buffer has to be sized by (item A6 of #4920, issue #4934).
  */
 static GstMemory *
-_sparse_new_extra_memory (GstTensorInfo *info)
+_sparse_new_extra_memory (GstTensorInfo *info, guint stride)
 {
   GstMemory *dense, *sparse;
   GstTensorMetaInfo meta;
@@ -11528,7 +14423,7 @@ _sparse_new_extra_memory (GstTensorInfo *info)
   data_size = gst_tensor_info_get_size (info);
   data = g_malloc0 (data_size);
   for (i = 0; i < 40U; i++)
-    ((gint32 *) data)[i] = (i % 10U == 0U) ? (gint32) (i + 1) : 0;
+    ((gint32 *) data)[i] = (i % stride == 0U) ? (gint32) (i + 1) : 0;
 
   dense = gst_memory_new_wrapped (
       GST_MEMORY_FLAG_READONLY, data, data_size, 0, data_size, data, g_free);
@@ -11581,7 +14476,7 @@ TEST (testTensorSparse, decExtraTensors)
   for (i = 0; i < SPARSE_EXTRA_TENSORS_NUM; i++) {
     GstTensorInfo info;
 
-    mem = _sparse_new_extra_memory (&info);
+    mem = _sparse_new_extra_memory (&info, 10U);
     ASSERT_TRUE (mem != NULL);
     ASSERT_TRUE (gst_tensor_buffer_append_memory (
         in, mem, gst_tensors_info_get_nth_info (&config.info, i)));
@@ -11603,6 +14498,76 @@ TEST (testTensorSparse, decExtraTensors)
     ASSERT_EQ (map.size, 40U * sizeof (gint32));
     for (j = 0; j < 40U; j++)
       EXPECT_EQ (((gint32 *) map.data)[j], (j % 10U == 0U) ? (gint32) (j + 1) : 0);
+    gst_memory_unmap (mem, &map);
+    gst_memory_unref (mem);
+  }
+
+  gst_buffer_unref (out);
+  gst_tensors_config_free (&config);
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Test for tensor_sparse_dec, the extra tensors of a buffer are shorter
+ *        than the dense tensors they encode.
+ * @details A single non-zero element encodes into 136 bytes where the dense
+ * tensor is 160, so the buffer only reads back when each extra tensor is sized
+ * by the memory that was appended (item A6 of #4920, issue #4934).
+ */
+TEST (testTensorSparse, decExtraTensorsShorterThanDense)
+{
+  GstHarness *h;
+  GstBuffer *in, *out;
+  GstMemory *mem;
+  GstMapInfo map;
+  GstTensorsConfig config;
+  GstTensorInfo *_info;
+  guint i, j;
+
+  h = gst_harness_new ("tensor_sparse_dec");
+  ASSERT_TRUE (h != NULL);
+
+  gst_tensors_config_init (&config);
+  config.info.num_tensors = SPARSE_EXTRA_TENSORS_NUM;
+  config.rate_n = 0;
+  config.rate_d = 1;
+
+  for (i = 0; i < SPARSE_EXTRA_TENSORS_NUM; i++) {
+    _info = gst_tensors_info_get_nth_info (&config.info, i);
+    _info->type = _NNS_INT32;
+    gst_tensor_parse_dimension ("40", _info->dimension);
+  }
+
+  gst_harness_set_sink_caps (h, gst_tensors_caps_from_config (&config));
+  gst_harness_set_src_caps_str (h, "other/tensors,format=sparse,framerate=0/1");
+
+  in = gst_buffer_new ();
+  for (i = 0; i < SPARSE_EXTRA_TENSORS_NUM; i++) {
+    GstTensorInfo info;
+
+    mem = _sparse_new_extra_memory (&info, 40U);
+    ASSERT_TRUE (mem != NULL);
+    ASSERT_EQ (gst_memory_get_sizes (mem, NULL, NULL), (gsize) 136);
+    ASSERT_TRUE (gst_tensor_buffer_append_memory (
+        in, mem, gst_tensors_info_get_nth_info (&config.info, i)));
+    gst_tensor_info_free (&info);
+  }
+  ASSERT_EQ (gst_tensor_buffer_get_count (in), SPARSE_EXTRA_TENSORS_NUM);
+
+  ASSERT_EQ (gst_harness_push (h, in), GST_FLOW_OK);
+  EXPECT_EQ (gst_harness_buffers_received (h), 1U);
+
+  out = gst_harness_pull (h);
+  ASSERT_TRUE (out != NULL);
+  ASSERT_EQ (gst_tensor_buffer_get_count (out), SPARSE_EXTRA_TENSORS_NUM);
+
+  for (i = 0; i < SPARSE_EXTRA_TENSORS_NUM; i++) {
+    mem = gst_tensor_buffer_get_nth_memory (out, i);
+    ASSERT_TRUE (mem != NULL);
+    ASSERT_TRUE (gst_memory_map (mem, &map, GST_MAP_READ));
+    ASSERT_EQ (map.size, 40U * sizeof (gint32));
+    for (j = 0; j < 40U; j++)
+      EXPECT_EQ (((gint32 *) map.data)[j], (j == 0U) ? (gint32) 1 : 0);
     gst_memory_unmap (mem, &map);
     gst_memory_unref (mem);
   }
@@ -11809,7 +14774,28 @@ TEST (testTensorDemux, setTensorpickTwice)
 }
 
 /**
+ * @brief Count the segments the tensorseg of an element describes.
+ */
+static guint
+_split_count_tensorseg (GstElement *element)
+{
+  gchar *tensorseg = NULL;
+  gchar **strv;
+  guint num;
+
+  g_object_get (element, "tensorseg", &tensorseg, NULL);
+  strv = g_strsplit (tensorseg, ",", -1);
+  num = g_strv_length (strv);
+  g_strfreev (strv);
+  g_free (tensorseg);
+
+  return num;
+}
+
+/**
  * @brief Set tensorseg while tensor_split is creating its first source pad.
+ * @details The buffer being split fixed the rule before the pad it is creating
+ *          was reported, so the racing set leaves the rule as it is.
  */
 TEST (testTensorSplit, setTensorsegWhileAddingPad)
 {
@@ -11839,6 +14825,7 @@ TEST (testTensorSplit, setTensorsegWhileAddingPad)
   gst_element_set_state (pipeline, GST_STATE_PLAYING);
   EXPECT_TRUE (_pad_race_set_property (&sync, split, "tensorseg", "1:4:4,2:4:4"));
   EXPECT_TRUE (wait_pipeline_process_buffers (&data_received, 1, TEST_TIMEOUT_LIMIT_MS));
+  EXPECT_EQ (_split_count_tensorseg (split), 1U);
 
   gst_element_set_state (pipeline, GST_STATE_NULL);
   gst_object_unref (sink);
@@ -11937,10 +14924,9 @@ TEST (testTensorSplit, setTensorpickTwice)
 
 /**
  * @brief Set tensorpick while tensor_split is creating its first source pad.
- * @details The pad creation decides whether to report no-more-pads by comparing
- *          the pick count with the pads created so far. Reading the property
- *          instead of the snapshot the buffer is being split by ends that
- *          report after src_0, and src_1 is then added behind it.
+ * @details The first buffer fixes the selection before the pad it is creating
+ *          is reported, so the racing set is refused. The pads are made from
+ *          the selection that stays, and no-more-pads comes once, after both.
  */
 TEST (testTensorSplit, setTensorpickWhileAddingPad)
 {
@@ -11975,7 +14961,7 @@ TEST (testTensorSplit, setTensorpickWhileAddingPad)
   EXPECT_EQ (_pad_race_wait_no_more_pads (&sync), 2U);
 
   g_object_get (split, "tensorpick", &tensorpick, NULL);
-  EXPECT_STREQ (tensorpick, "0");
+  EXPECT_STREQ (tensorpick, "0,1");
   g_free (tensorpick);
 
   gst_element_set_state (pipeline, GST_STATE_NULL);
@@ -12099,38 +15085,1077 @@ TEST (testTensorDemux, pushOutOfRangeTensorpick_n)
 }
 
 /**
- * @brief A source pad with no segment rule left for it is refused.
- * @details The rule array is replaced on every tensorseg set, so it can shrink
- *          under source pads that already exist. The pad created after that
- *          takes the next ordinal, which is then past the end of the array.
+ * @brief Number of tensor_split source pads a splitPadOutput array covers.
  */
-TEST (testTensorSplit, addPadBeyondTensorseg_n)
-{
-  GstHarness *h = gst_harness_new_with_padnames ("tensor_split", "sink", NULL);
-  GstTensorsConfig config;
-  gsize data_size;
+#define SPLIT_TEST_MAX_PADS (4U)
 
-  ASSERT_TRUE (h != NULL);
+/**
+ * @brief What went out on one tensor_split source pad.
+ */
+typedef struct {
+  guint buffers; /**< number of buffers pushed on the pad */
+  gchar *dimension; /**< dimension in the caps of the pad at the last buffer */
+  tensor_type type; /**< element type in the caps of the pad at the last buffer */
+  gint rate_n; /**< framerate numerator in the caps of the pad */
+  gint rate_d; /**< framerate denominator in the caps of the pad */
+  gsize caps_size; /**< bytes of the tensor the caps of the pad describe */
+  gsize buffer_size; /**< bytes of the last buffer */
+  guint first_byte; /**< first byte of the last buffer */
+} splitPadOutput;
+
+/**
+ * @brief Buffer probe recording what goes out on a tensor_split source pad.
+ * @details The buffer is dropped, which the pad reports as a successful push,
+ *          so the element goes on to the next segment as if it were linked.
+ */
+static GstPadProbeReturn
+_split_record_output (GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
+{
+  splitPadOutput *outputs = (splitPadOutput *) user_data;
+  GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER (info);
+  gchar *name = gst_pad_get_name (pad);
+  guint idx = (guint) g_ascii_strtoull (name + strlen ("src_"), NULL, 10);
+  GstCaps *caps = gst_pad_get_current_caps (pad);
+  GstTensorsConfig config;
+  splitPadOutput *out;
+  guint8 first = 0;
+
+  g_free (name);
+  EXPECT_LT (idx, SPLIT_TEST_MAX_PADS);
+  EXPECT_TRUE (caps != NULL);
+  if (idx >= SPLIT_TEST_MAX_PADS || caps == NULL)
+    goto done;
+
+  out = &outputs[idx];
+  out->buffers++;
+  out->buffer_size = gst_buffer_get_size (buf);
+  gst_buffer_extract (buf, 0, &first, 1);
+  out->first_byte = first;
+
+  gst_tensors_config_init (&config);
+  if (gst_tensors_config_from_caps (&config, caps, TRUE)) {
+    g_free (out->dimension);
+    out->dimension = gst_tensor_get_dimension_string (config.info.info[0].dimension);
+    out->type = config.info.info[0].type;
+    out->rate_n = config.rate_n;
+    out->rate_d = config.rate_d;
+    out->caps_size = gst_tensors_info_get_size (&config.info, 0);
+  }
+  gst_tensors_config_free (&config);
+
+done:
+  if (caps)
+    gst_caps_unref (caps);
+  return GST_PAD_PROBE_DROP;
+}
+
+/**
+ * @brief Handler of "pad-added", which puts the recording probe on the pad.
+ */
+static void
+_split_pad_added (GstElement *element, GstPad *pad, gpointer user_data)
+{
+  UNUSED (element);
+
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, _split_record_output, user_data, NULL);
+}
+
+/**
+ * @brief Build the caps of a single-tensor stream.
+ * @param[out] size bytes of one tensor of the stream
+ */
+static GstCaps *
+_split_stream_caps (const gchar *dimension, tensor_type type, gint rate_n,
+    gint rate_d, gsize *size)
+{
+  GstTensorsConfig config;
+  GstCaps *caps;
 
   gst_tensors_config_init (&config);
   config.info.num_tensors = 1;
-  config.info.info[0].type = _NNS_UINT8;
-  gst_tensor_parse_dimension ("2:8:8", config.info.info[0].dimension);
-  config.rate_n = 0;
-  config.rate_d = 1;
-  gst_harness_set_src_caps (h, gst_tensors_caps_from_config (&config));
-  data_size = gst_tensors_info_get_size (&config.info, 0);
+  config.info.info[0].type = type;
+  gst_tensor_parse_dimension (dimension, config.info.info[0].dimension);
+  config.rate_n = rate_n;
+  config.rate_d = rate_d;
 
-  /* picking the second of two rules puts src_0 at ordinal 0 of two */
-  g_object_set (h->element, "tensorseg", "1:8:8,1:8:8", "tensorpick", "1", NULL);
-  EXPECT_NE (gst_harness_push (h, gst_harness_create_buffer (h, data_size)), GST_FLOW_ERROR);
-
-  /* one rule now, but src_0 already took ordinal 0 */
-  g_object_set (h->element, "tensorseg", "2:8:8", "tensorpick", "0", NULL);
-  EXPECT_EQ (gst_harness_push (h, gst_harness_create_buffer (h, data_size)), GST_FLOW_ERROR);
-
+  caps = gst_tensors_caps_from_config (&config);
+  *size = gst_tensors_info_get_size (&config.info, 0);
   gst_tensors_config_free (&config);
+
+  return caps;
+}
+
+/**
+ * @brief Feed a tensor_split harness a stream of the given description.
+ * @return bytes of one tensor of the stream
+ */
+static gsize
+_split_set_src_caps (GstHarness *h, const gchar *dimension, tensor_type type,
+    gint rate_n, gint rate_d)
+{
+  gsize size;
+
+  gst_harness_set_src_caps (h, _split_stream_caps (dimension, type, rate_n, rate_d, &size));
+
+  return size;
+}
+
+/**
+ * @brief Get a tensor_split harness fed with uint8 tensors of the given shape.
+ * @param[out] size bytes of one incoming tensor
+ */
+static GstHarness *
+_split_harness_new (const gchar *dimension, splitPadOutput *outputs, gsize *size)
+{
+  GstHarness *h = gst_harness_new_with_padnames ("tensor_split", "sink", NULL);
+
+  g_signal_connect (h->element, "pad-added", G_CALLBACK (_split_pad_added), outputs);
+  *size = _split_set_src_caps (h, dimension, _NNS_UINT8, 0, 1);
+
+  return h;
+}
+
+/**
+ * @brief Push a tensor whose byte i is i % 256, so a segment is known by its first byte.
+ */
+static GstFlowReturn
+_split_push (GstHarness *h, gsize size)
+{
+  GstBuffer *buf = gst_harness_create_buffer (h, size);
+  GstMapInfo map;
+  gsize i;
+
+  if (!gst_buffer_map (buf, &map, GST_MAP_WRITE)) {
+    gst_buffer_unref (buf);
+    return GST_FLOW_ERROR;
+  }
+  for (i = 0; i < size; i++)
+    map.data[i] = (guint8) i;
+  gst_buffer_unmap (buf, &map);
+
+  return gst_harness_push (h, buf);
+}
+
+/**
+ * @brief Release what a splitPadOutput array holds.
+ */
+static void
+_split_outputs_clear (splitPadOutput *outputs)
+{
+  guint i;
+
+  for (i = 0; i < SPLIT_TEST_MAX_PADS; i++)
+    g_free (outputs[i].dimension);
+}
+
+/**
+ * @brief Without tensorpick, src_n carries segment n.
+ */
+TEST (testTensorSplit, segmentsWithoutTensorpick)
+{
+  splitPadOutput out[SPLIT_TEST_MAX_PADS] = {};
+  gsize size;
+  GstHarness *h = _split_harness_new ("6:8:8", out, &size);
+
+  g_object_set (h->element, "tensorseg", "1:8:8,2:8:8,3:8:8", NULL);
+  EXPECT_EQ (_split_push (h, size), GST_FLOW_OK);
+
+  EXPECT_EQ (out[0].buffers, 1U);
+  EXPECT_STREQ (out[0].dimension, "1:8:8");
+  EXPECT_EQ (out[0].caps_size, 64U);
+  EXPECT_EQ (out[0].buffer_size, 64U);
+  EXPECT_EQ (out[0].first_byte, 0U);
+
+  EXPECT_EQ (out[1].buffers, 1U);
+  EXPECT_STREQ (out[1].dimension, "2:8:8");
+  EXPECT_EQ (out[1].caps_size, 128U);
+  EXPECT_EQ (out[1].buffer_size, 128U);
+  EXPECT_EQ (out[1].first_byte, 64U);
+
+  EXPECT_EQ (out[2].buffers, 1U);
+  EXPECT_STREQ (out[2].dimension, "3:8:8");
+  EXPECT_EQ (out[2].caps_size, 192U);
+  EXPECT_EQ (out[2].buffer_size, 192U);
+  EXPECT_EQ (out[2].first_byte, 192U);
+
+  _split_outputs_clear (out);
   gst_harness_teardown (h);
+}
+
+/**
+ * @brief A tensorpick that skips the first segment describes the segment it carries.
+ * @details The segments differ in size, so describing src_0 by the first
+ *          segment would announce 64 bytes for a 128-byte buffer.
+ */
+TEST (testTensorSplit, tensorpickSkippingFirstSegment)
+{
+  splitPadOutput out[SPLIT_TEST_MAX_PADS] = {};
+  gsize size;
+  GstHarness *h = _split_harness_new ("3:8:8", out, &size);
+
+  g_object_set (h->element, "tensorseg", "1:8:8,2:8:8", "tensorpick", "1", NULL);
+  EXPECT_EQ (_split_push (h, size), GST_FLOW_OK);
+
+  EXPECT_EQ (out[0].buffers, 1U);
+  EXPECT_STREQ (out[0].dimension, "2:8:8");
+  EXPECT_EQ (out[0].caps_size, 128U);
+  EXPECT_EQ (out[0].buffer_size, 128U);
+  EXPECT_EQ (out[0].first_byte, 64U);
+  EXPECT_EQ (out[1].buffers, 0U);
+
+  _split_outputs_clear (out);
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief A tensorpick with a gap is numbered in segment order, whatever order it lists.
+ */
+TEST (testTensorSplit, tensorpickWithGap)
+{
+  const gchar *picks[] = { "0,2", "2,0" };
+  guint i;
+
+  for (i = 0; i < G_N_ELEMENTS (picks); i++) {
+    splitPadOutput out[SPLIT_TEST_MAX_PADS] = {};
+    gsize size;
+    GstHarness *h = _split_harness_new ("6:8:8", out, &size);
+
+    SCOPED_TRACE (picks[i]);
+    g_object_set (h->element, "tensorseg", "1:8:8,2:8:8,3:8:8", "tensorpick",
+        picks[i], NULL);
+    EXPECT_EQ (_split_push (h, size), GST_FLOW_OK);
+
+    EXPECT_EQ (out[0].buffers, 1U);
+    EXPECT_STREQ (out[0].dimension, "1:8:8");
+    EXPECT_EQ (out[0].caps_size, 64U);
+    EXPECT_EQ (out[0].buffer_size, 64U);
+    EXPECT_EQ (out[0].first_byte, 0U);
+
+    EXPECT_EQ (out[1].buffers, 1U);
+    EXPECT_STREQ (out[1].dimension, "3:8:8");
+    EXPECT_EQ (out[1].caps_size, 192U);
+    EXPECT_EQ (out[1].buffer_size, 192U);
+    EXPECT_EQ (out[1].first_byte, 192U);
+
+    EXPECT_EQ (out[2].buffers, 0U);
+
+    _split_outputs_clear (out);
+    gst_harness_teardown (h);
+  }
+}
+
+/**
+ * @brief A tensorseg set while the stream runs is refused, rule and pads intact.
+ * @details The caps of a source pad are taken when it is created, so a rule
+ *          that changed under it would leave it carrying a segment of another
+ *          size than it announces. The rule is fixed by the first buffer.
+ */
+TEST (testTensorSplit, setTensorsegWhileStreaming_n)
+{
+  splitPadOutput out[SPLIT_TEST_MAX_PADS] = {};
+  gsize size;
+  GstHarness *h = _split_harness_new ("3:4:4", out, &size);
+
+  g_object_set (h->element, "tensorseg", "1:4:4,2:4:4", NULL);
+  EXPECT_EQ (_split_push (h, size), GST_FLOW_OK);
+  EXPECT_EQ (_split_count_tensorseg (h->element), 2U);
+
+  g_object_set (h->element, "tensorseg", "2:4:4", NULL);
+  EXPECT_EQ (_split_count_tensorseg (h->element), 2U);
+
+  EXPECT_EQ (_split_push (h, size), GST_FLOW_OK);
+  EXPECT_EQ ((guint) h->element->numsrcpads, 2U);
+
+  EXPECT_EQ (out[0].buffers, 2U);
+  EXPECT_STREQ (out[0].dimension, "1:4:4");
+  EXPECT_EQ (out[0].caps_size, 16U);
+  EXPECT_EQ (out[0].buffer_size, 16U);
+  EXPECT_EQ (out[0].first_byte, 0U);
+
+  EXPECT_EQ (out[1].buffers, 2U);
+  EXPECT_STREQ (out[1].dimension, "2:4:4");
+  EXPECT_EQ (out[1].caps_size, 32U);
+  EXPECT_EQ (out[1].buffer_size, 32U);
+  EXPECT_EQ (out[1].first_byte, 16U);
+
+  _split_outputs_clear (out);
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief A tensorpick set while the stream runs is refused, selection intact.
+ * @details A newly picked segment would get a pad behind the pads that exist,
+ *          numbered out of segment order and added after no-more-pads.
+ */
+TEST (testTensorSplit, setTensorpickWhileStreaming_n)
+{
+  splitPadOutput out[SPLIT_TEST_MAX_PADS] = {};
+  gchar *tensorpick = NULL;
+  gsize size;
+  GstHarness *h = _split_harness_new ("3:4:4", out, &size);
+
+  g_object_set (h->element, "tensorseg", "1:4:4,2:4:4", "tensorpick", "1", NULL);
+  EXPECT_EQ (_split_push (h, size), GST_FLOW_OK);
+
+  g_object_set (h->element, "tensorpick", "0,1", NULL);
+  g_object_get (h->element, "tensorpick", &tensorpick, NULL);
+  EXPECT_STREQ (tensorpick, "1");
+  g_free (tensorpick);
+
+  EXPECT_EQ (_split_push (h, size), GST_FLOW_OK);
+  EXPECT_EQ ((guint) h->element->numsrcpads, 1U);
+
+  EXPECT_EQ (out[0].buffers, 2U);
+  EXPECT_STREQ (out[0].dimension, "2:4:4");
+  EXPECT_EQ (out[0].buffer_size, 32U);
+  EXPECT_EQ (out[0].first_byte, 16U);
+  EXPECT_EQ (out[1].buffers, 0U);
+
+  _split_outputs_clear (out);
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief silent stays writable while the stream runs.
+ * @details Only the properties the source pads are described by are fixed.
+ */
+TEST (testTensorSplit, setSilentWhileStreaming)
+{
+  splitPadOutput out[SPLIT_TEST_MAX_PADS] = {};
+  gboolean silent = TRUE;
+  gsize size;
+  GstHarness *h = _split_harness_new ("3:4:4", out, &size);
+
+  g_object_set (h->element, "tensorseg", "3:4:4", NULL);
+  EXPECT_EQ (_split_push (h, size), GST_FLOW_OK);
+
+  g_object_set (h->element, "silent", FALSE, NULL);
+  g_object_get (h->element, "silent", &silent, NULL);
+  EXPECT_FALSE (silent);
+
+  _split_outputs_clear (out);
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief An input type changing while the stream runs reaches the source pads.
+ * @details The segments keep the dimensions the rule gives them, so only the
+ *          element type moves, and with it the bytes each pad carries.
+ */
+TEST (testTensorSplit, renegotiateInputType)
+{
+  splitPadOutput out[SPLIT_TEST_MAX_PADS] = {};
+  gsize size;
+  GstHarness *h = _split_harness_new ("3:4:4", out, &size);
+
+  g_object_set (h->element, "tensorseg", "1:4:4,2:4:4", NULL);
+  EXPECT_EQ (_split_push (h, size), GST_FLOW_OK);
+  EXPECT_EQ (out[0].type, _NNS_UINT8);
+  EXPECT_EQ (out[0].caps_size, 16U);
+  EXPECT_EQ (out[1].type, _NNS_UINT8);
+  EXPECT_EQ (out[1].caps_size, 32U);
+
+  size = _split_set_src_caps (h, "3:4:4", _NNS_FLOAT32, 0, 1);
+  EXPECT_EQ (_split_push (h, size), GST_FLOW_OK);
+
+  EXPECT_EQ (out[0].buffers, 2U);
+  EXPECT_STREQ (out[0].dimension, "1:4:4");
+  EXPECT_EQ (out[0].type, _NNS_FLOAT32);
+  EXPECT_EQ (out[0].caps_size, 64U);
+  EXPECT_EQ (out[0].buffer_size, 64U);
+
+  EXPECT_EQ (out[1].buffers, 2U);
+  EXPECT_STREQ (out[1].dimension, "2:4:4");
+  EXPECT_EQ (out[1].type, _NNS_FLOAT32);
+  EXPECT_EQ (out[1].caps_size, 128U);
+  EXPECT_EQ (out[1].buffer_size, 128U);
+
+  _split_outputs_clear (out);
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief An input framerate changing while the stream runs reaches the source pads.
+ */
+TEST (testTensorSplit, renegotiateInputFramerate)
+{
+  splitPadOutput out[SPLIT_TEST_MAX_PADS] = {};
+  gsize size;
+  GstHarness *h = _split_harness_new ("3:4:4", out, &size);
+
+  g_object_set (h->element, "tensorseg", "1:4:4,2:4:4", NULL);
+  EXPECT_EQ (_split_push (h, size), GST_FLOW_OK);
+  EXPECT_EQ (out[0].rate_n, 0);
+  EXPECT_EQ (out[0].rate_d, 1);
+
+  size = _split_set_src_caps (h, "3:4:4", _NNS_UINT8, 30, 1);
+  EXPECT_EQ (_split_push (h, size), GST_FLOW_OK);
+
+  EXPECT_EQ (out[0].buffers, 2U);
+  EXPECT_EQ (out[0].rate_n, 30);
+  EXPECT_EQ (out[0].rate_d, 1);
+  EXPECT_EQ (out[0].caps_size, 16U);
+  EXPECT_EQ (out[0].buffer_size, 16U);
+
+  EXPECT_EQ (out[1].buffers, 2U);
+  EXPECT_EQ (out[1].rate_n, 30);
+  EXPECT_EQ (out[1].rate_d, 1);
+
+  _split_outputs_clear (out);
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief An input shape changing while the stream runs leaves the source pads alone.
+ * @details A pad takes its dimensions from the rule, not from the input, so a
+ *          bigger tensor is cut by the same rule and its tail is dropped.
+ */
+TEST (testTensorSplit, renegotiateInputDimension)
+{
+  splitPadOutput out[SPLIT_TEST_MAX_PADS] = {};
+  gsize size;
+  GstHarness *h = _split_harness_new ("3:4:4", out, &size);
+
+  g_object_set (h->element, "tensorseg", "1:4:4,2:4:4", NULL);
+  EXPECT_EQ (_split_push (h, size), GST_FLOW_OK);
+
+  size = _split_set_src_caps (h, "3:8:8", _NNS_UINT8, 0, 1);
+  EXPECT_EQ (_split_push (h, size), GST_FLOW_OK);
+
+  EXPECT_EQ (out[0].buffers, 2U);
+  EXPECT_STREQ (out[0].dimension, "1:4:4");
+  EXPECT_EQ (out[0].caps_size, 16U);
+  EXPECT_EQ (out[0].buffer_size, 16U);
+  EXPECT_EQ (out[0].first_byte, 0U);
+
+  EXPECT_EQ (out[1].buffers, 2U);
+  EXPECT_STREQ (out[1].dimension, "2:4:4");
+  EXPECT_EQ (out[1].caps_size, 32U);
+  EXPECT_EQ (out[1].buffer_size, 32U);
+  EXPECT_EQ (out[1].first_byte, 16U);
+
+  _split_outputs_clear (out);
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief An input renegotiated before the first buffer describes the pads that follow.
+ */
+TEST (testTensorSplit, renegotiateBeforeFirstBuffer)
+{
+  splitPadOutput out[SPLIT_TEST_MAX_PADS] = {};
+  gsize size;
+  GstHarness *h = _split_harness_new ("3:4:4", out, &size);
+
+  g_object_set (h->element, "tensorseg", "1:4:4,2:4:4", NULL);
+  size = _split_set_src_caps (h, "3:4:4", _NNS_FLOAT32, 0, 1);
+  EXPECT_EQ ((guint) h->element->numsrcpads, 0U);
+
+  EXPECT_EQ (_split_push (h, size), GST_FLOW_OK);
+
+  EXPECT_EQ (out[0].buffers, 1U);
+  EXPECT_EQ (out[0].type, _NNS_FLOAT32);
+  EXPECT_EQ (out[0].caps_size, 64U);
+  EXPECT_EQ (out[0].buffer_size, 64U);
+  EXPECT_EQ (out[1].buffers, 1U);
+  EXPECT_EQ (out[1].type, _NNS_FLOAT32);
+  EXPECT_EQ (out[1].caps_size, 128U);
+  EXPECT_EQ (out[1].buffer_size, 128U);
+
+  _split_outputs_clear (out);
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief An input renegotiated below what the rule needs is refused per buffer.
+ * @details The pads follow the new type, and the buffers that no longer hold
+ *          the segments are refused rather than cut short.
+ */
+TEST (testTensorSplit, renegotiateBelowTensorseg_n)
+{
+  splitPadOutput out[SPLIT_TEST_MAX_PADS] = {};
+  gsize size;
+  GstHarness *h = _split_harness_new ("3:4:4", out, &size);
+
+  g_object_set (h->element, "tensorseg", "1:4:4,2:4:4", NULL);
+  EXPECT_EQ (_split_push (h, size), GST_FLOW_OK);
+
+  size = _split_set_src_caps (h, "1:4:4", _NNS_UINT8, 0, 1);
+  EXPECT_EQ (_split_push (h, size), GST_FLOW_ERROR);
+
+  EXPECT_EQ (out[0].buffers, 2U);
+  EXPECT_EQ (out[0].caps_size, 16U);
+  EXPECT_EQ (out[0].buffer_size, 16U);
+  EXPECT_EQ (out[1].buffers, 1U);
+
+  _split_outputs_clear (out);
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Handler of "pad-added" linking the first source pad to a sink pad of the case.
+ */
+static void
+_split_link_first_pad (GstElement *element, GstPad *pad, gpointer user_data)
+{
+  GstPad *sinkpad = (GstPad *) user_data;
+
+  UNUSED (element);
+
+  if (!gst_pad_is_linked (sinkpad)) {
+    EXPECT_EQ (gst_pad_link (pad, sinkpad), GST_PAD_LINK_OK);
+  }
+}
+
+/**
+ * @brief Give a harnessed element a bus of its own, to read its messages from.
+ */
+static GstBus *
+_split_harness_bus (GstHarness *h)
+{
+  GstBus *bus = gst_bus_new ();
+
+  gst_element_set_bus (h->element, bus);
+  return bus;
+}
+
+/**
+ * @brief Take the bus back off the element and release it.
+ */
+static void
+_split_harness_bus_clear (GstHarness *h, GstBus *bus)
+{
+  gst_element_set_bus (h->element, NULL);
+  gst_object_unref (bus);
+}
+
+/**
+ * @brief A rule refused while the stream runs reaches the application.
+ * @details g_object_set() cannot fail, so a message on the bus is all an
+ *          application has to learn that the rule it set was not taken.
+ */
+TEST (testTensorSplit, refusedRuleWarnsOnTheBus)
+{
+  splitPadOutput out[SPLIT_TEST_MAX_PADS] = {};
+  gsize size;
+  GstHarness *h = _split_harness_new ("3:4:4", out, &size);
+  GstBus *bus = _split_harness_bus (h);
+  GstMessage *msg;
+
+  g_object_set (h->element, "tensorseg", "1:4:4,2:4:4", NULL);
+  EXPECT_TRUE (gst_bus_pop_filtered (bus, GST_MESSAGE_WARNING) == NULL);
+
+  EXPECT_EQ (_split_push (h, size), GST_FLOW_OK);
+
+  g_object_set (h->element, "tensorseg", "3:4:4", NULL);
+  msg = gst_bus_pop_filtered (bus, GST_MESSAGE_WARNING);
+  EXPECT_TRUE (msg != NULL);
+  if (msg)
+    gst_message_unref (msg);
+
+  g_object_set (h->element, "tensorpick", "0", NULL);
+  msg = gst_bus_pop_filtered (bus, GST_MESSAGE_WARNING);
+  EXPECT_TRUE (msg != NULL);
+  if (msg)
+    gst_message_unref (msg);
+
+  g_object_set (h->element, "silent", FALSE, NULL);
+  EXPECT_TRUE (gst_bus_pop_filtered (bus, GST_MESSAGE_WARNING) == NULL);
+
+  _split_harness_bus_clear (h, bus);
+  _split_outputs_clear (out);
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Setting the rule the element already has is not a change, nor refused.
+ * @details An application that keeps its properties in step with a pipeline
+ *          sets them as they are, which asks for nothing and is told nothing.
+ */
+TEST (testTensorSplit, setSameRuleWhileStreaming)
+{
+  splitPadOutput out[SPLIT_TEST_MAX_PADS] = {};
+  GstMessage *msg;
+  gsize size;
+  GstHarness *h = _split_harness_new ("3:4:4", out, &size);
+  GstBus *bus = _split_harness_bus (h);
+
+  g_object_set (h->element, "tensorseg", "1:4:4,2:4:4", "tensorpick", "0,1", NULL);
+  EXPECT_EQ (_split_push (h, size), GST_FLOW_OK);
+
+  g_object_set (h->element, "tensorseg", "1:4:4,2:4:4", NULL);
+  EXPECT_TRUE (gst_bus_pop_filtered (bus, GST_MESSAGE_WARNING) == NULL);
+
+  g_object_set (h->element, "tensorpick", "0,1", NULL);
+  EXPECT_TRUE (gst_bus_pop_filtered (bus, GST_MESSAGE_WARNING) == NULL);
+
+  /* the separators the property accepts do not make it another rule */
+  g_object_set (h->element, "tensorseg", "1:4:4;2:4:4", NULL);
+  EXPECT_TRUE (gst_bus_pop_filtered (bus, GST_MESSAGE_WARNING) == NULL);
+
+  /* as many segments of as many bytes, cut in another order, is another rule */
+  g_object_set (h->element, "tensorseg", "2:4:4,1:4:4", NULL);
+  msg = gst_bus_pop_filtered (bus, GST_MESSAGE_WARNING);
+  EXPECT_TRUE (msg != NULL);
+  if (msg)
+    gst_message_unref (msg);
+
+  /* so is a selection that is the start of the one it holds */
+  g_object_set (h->element, "tensorpick", "0", NULL);
+  msg = gst_bus_pop_filtered (bus, GST_MESSAGE_WARNING);
+  EXPECT_TRUE (msg != NULL);
+  if (msg)
+    gst_message_unref (msg);
+
+  EXPECT_EQ (_split_count_tensorseg (h->element), 2U);
+  EXPECT_EQ (_split_push (h, size), GST_FLOW_OK);
+  EXPECT_EQ (out[0].buffers, 2U);
+  EXPECT_EQ (out[0].buffer_size, 16U);
+  EXPECT_EQ (out[1].buffers, 2U);
+  EXPECT_EQ (out[1].buffer_size, 32U);
+
+  _split_harness_bus_clear (h, bus);
+  _split_outputs_clear (out);
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief The caps a sink pad answers a caps query with, and the caps it took.
+ */
+typedef struct {
+  GstCaps *query_caps; /**< what the pad answers a caps query with */
+  GstCaps *taken; /**< the caps of the last caps event it took */
+  guint buffers; /**< buffers the pad received */
+} splitAnySink;
+
+/**
+ * @brief Event handler of a sink pad that takes any caps and remembers them.
+ */
+static gboolean
+_split_any_sink_event (GstPad *pad, GstObject *parent, GstEvent *event)
+{
+  splitAnySink *sink = (splitAnySink *) gst_pad_get_element_private (pad);
+  GstCaps *caps;
+
+  UNUSED (parent);
+
+  if (GST_EVENT_TYPE (event) == GST_EVENT_CAPS) {
+    gst_event_parse_caps (event, &caps);
+    gst_caps_replace (&sink->taken, caps);
+  }
+
+  gst_event_unref (event);
+  return TRUE;
+}
+
+/**
+ * @brief Caps query handler of the sink pad, which reports both tensor media types.
+ * @details A peer that can take other/tensor is what makes
+ *          gst_tensor_pad_caps_from_config() answer other/tensor, which a pad
+ *          created without a peer never announced.
+ */
+static gboolean
+_split_any_sink_query (GstPad *pad, GstObject *parent, GstQuery *query)
+{
+  splitAnySink *sink = (splitAnySink *) gst_pad_get_element_private (pad);
+
+  if (GST_QUERY_TYPE (query) == GST_QUERY_CAPS) {
+    gst_query_set_caps_result (query, sink->query_caps);
+    return TRUE;
+  }
+
+  return gst_pad_query_default (pad, parent, query);
+}
+
+/**
+ * @brief Chain handler of the sink pad, which counts and drops the buffer.
+ */
+static GstFlowReturn
+_split_any_sink_chain (GstPad *pad, GstObject *parent, GstBuffer *buffer)
+{
+  splitAnySink *sink = (splitAnySink *) gst_pad_get_element_private (pad);
+
+  UNUSED (parent);
+
+  sink->buffers++;
+  gst_buffer_unref (buffer);
+  return GST_FLOW_OK;
+}
+
+/**
+ * @brief A renegotiated pad keeps the media type it was created with.
+ * @details A pad is described before it is added to the element, so its caps
+ *          are built without a peer and come out as other/tensors. Building
+ *          them from the config once the pad is linked asks the peer instead,
+ *          and a peer that takes other/tensor would put that on a pad that has
+ *          been announcing other/tensors all along.
+ */
+TEST (testTensorSplit, renegotiateKeepsMediaType)
+{
+  GstHarness *h = gst_harness_new_with_padnames ("tensor_split", "sink", NULL);
+  splitAnySink sink = { NULL, NULL, 0 };
+  GstPad *sinkpad = gst_pad_new ("sink", GST_PAD_SINK);
+  GstStructure *structure;
+  gsize size;
+
+  ASSERT_TRUE (h != NULL);
+  sink.query_caps = gst_caps_from_string ("other/tensor; other/tensors");
+  gst_pad_set_event_function (sinkpad, _split_any_sink_event);
+  gst_pad_set_query_function (sinkpad, _split_any_sink_query);
+  gst_pad_set_chain_function (sinkpad, _split_any_sink_chain);
+  gst_pad_set_element_private (sinkpad, &sink);
+  gst_pad_set_active (sinkpad, TRUE);
+
+  g_signal_connect (h->element, "pad-added", G_CALLBACK (_split_link_first_pad), sinkpad);
+  g_object_set (h->element, "tensorseg", "3:4:4", NULL);
+
+  size = _split_set_src_caps (h, "3:4:4", _NNS_UINT8, 0, 1);
+  EXPECT_EQ (gst_harness_push (h, gst_harness_create_buffer (h, size)), GST_FLOW_OK);
+  EXPECT_TRUE (sink.taken != NULL);
+  if (sink.taken) {
+    structure = gst_caps_get_structure (sink.taken, 0);
+    EXPECT_STREQ (gst_structure_get_name (structure), "other/tensors");
+  }
+
+  size = _split_set_src_caps (h, "3:4:4", _NNS_FLOAT32, 0, 1);
+  EXPECT_EQ (gst_harness_push (h, gst_harness_create_buffer (h, size)), GST_FLOW_OK);
+  EXPECT_EQ (sink.buffers, 2U);
+
+  EXPECT_TRUE (sink.taken != NULL);
+  if (sink.taken) {
+    structure = gst_caps_get_structure (sink.taken, 0);
+    EXPECT_STREQ (gst_structure_get_name (structure), "other/tensors");
+    EXPECT_STREQ (gst_structure_get_string (structure, "types"), "float32");
+    EXPECT_STREQ (gst_structure_get_string (structure, "dimensions"), "3:4:4");
+  }
+
+  gst_harness_teardown (h);
+  gst_pad_set_active (sinkpad, FALSE);
+  gst_object_unref (sinkpad);
+  gst_caps_unref (sink.query_caps);
+  if (sink.taken)
+    gst_caps_unref (sink.taken);
+}
+
+/**
+ * @brief What a sink pad pinned to the caps it was linked with saw.
+ */
+typedef struct {
+  GstCaps *accepted; /**< the caps the pad took, the only ones it takes */
+  guint refused; /**< caps events the pad turned down */
+  guint buffers; /**< buffers the pad received */
+} splitPinnedSink;
+
+/**
+ * @brief Event handler of a sink pad that takes one set of caps and no other.
+ * @details This is what a capsfilter downstream of the element does to a
+ *          renegotiation it cannot follow.
+ */
+static gboolean
+_split_pinned_sink_event (GstPad *pad, GstObject *parent, GstEvent *event)
+{
+  splitPinnedSink *sink = (splitPinnedSink *) gst_pad_get_element_private (pad);
+  GstCaps *caps;
+
+  UNUSED (parent);
+
+  if (GST_EVENT_TYPE (event) == GST_EVENT_CAPS) {
+    gst_event_parse_caps (event, &caps);
+    if (sink->accepted == NULL) {
+      sink->accepted = gst_caps_ref (caps);
+    } else if (!gst_caps_is_equal (sink->accepted, caps)) {
+      sink->refused++;
+      gst_event_unref (event);
+      return FALSE;
+    }
+  }
+
+  gst_event_unref (event);
+  return TRUE;
+}
+
+/**
+ * @brief Query handler of the pinned sink pad, which accepts its caps only.
+ */
+static gboolean
+_split_pinned_sink_query (GstPad *pad, GstObject *parent, GstQuery *query)
+{
+  splitPinnedSink *sink = (splitPinnedSink *) gst_pad_get_element_private (pad);
+  GstCaps *caps;
+  gboolean accept;
+
+  if (GST_QUERY_TYPE (query) == GST_QUERY_ACCEPT_CAPS && sink->accepted != NULL) {
+    gst_query_parse_accept_caps (query, &caps);
+    accept = gst_caps_is_equal (sink->accepted, caps);
+    if (!accept)
+      sink->refused++;
+    gst_query_set_accept_caps_result (query, accept);
+    return TRUE;
+  }
+
+  return gst_pad_query_default (pad, parent, query);
+}
+
+/**
+ * @brief Chain handler of the pinned sink pad, which counts and drops the buffer.
+ */
+static GstFlowReturn
+_split_pinned_sink_chain (GstPad *pad, GstObject *parent, GstBuffer *buffer)
+{
+  splitPinnedSink *sink = (splitPinnedSink *) gst_pad_get_element_private (pad);
+
+  UNUSED (parent);
+
+  sink->buffers++;
+  gst_buffer_unref (buffer);
+  return GST_FLOW_OK;
+}
+
+/**
+ * @brief A renegotiation a source pad cannot pass on fails the stream.
+ * @details Pushing buffers of the new type on a pad still announcing the old
+ *          one would hand downstream tensors it reads by the wrong type. The
+ *          caps event is refused instead, which leaves it pending on the sink
+ *          pad, so the buffer behind it never reaches the peer either.
+ */
+TEST (testTensorSplit, renegotiateRefusedDownstream_n)
+{
+  GstHarness *h = gst_harness_new_with_padnames ("tensor_split", "sink", NULL);
+  splitPinnedSink sink = { NULL, 0, 0 };
+  GstPad *sinkpad = gst_pad_new ("sink", GST_PAD_SINK);
+  GstMessage *msg;
+  GstCaps *caps;
+  GstBus *bus;
+  gsize size;
+
+  ASSERT_TRUE (h != NULL);
+  gst_pad_set_event_function (sinkpad, _split_pinned_sink_event);
+  gst_pad_set_query_function (sinkpad, _split_pinned_sink_query);
+  gst_pad_set_chain_function (sinkpad, _split_pinned_sink_chain);
+  gst_pad_set_element_private (sinkpad, &sink);
+  gst_pad_set_active (sinkpad, TRUE);
+
+  bus = _split_harness_bus (h);
+  g_signal_connect (h->element, "pad-added", G_CALLBACK (_split_link_first_pad), sinkpad);
+  g_object_set (h->element, "tensorseg", "3:4:4", NULL);
+
+  size = _split_set_src_caps (h, "3:4:4", _NNS_UINT8, 0, 1);
+  EXPECT_EQ (gst_harness_push (h, gst_harness_create_buffer (h, size)), GST_FLOW_OK);
+  EXPECT_EQ (sink.buffers, 1U);
+  EXPECT_TRUE (sink.accepted != NULL);
+
+  caps = _split_stream_caps ("3:4:4", _NNS_FLOAT32, 0, 1, &size);
+  gst_harness_push_event (h, gst_event_new_caps (caps));
+  gst_caps_unref (caps);
+  EXPECT_GT (sink.refused, 0U);
+
+  msg = gst_bus_pop_filtered (bus, GST_MESSAGE_ERROR);
+  EXPECT_TRUE (msg != NULL);
+  if (msg) {
+    GError *err = NULL;
+
+    gst_message_parse_error (msg, &err, NULL);
+    EXPECT_EQ (err->domain, GST_CORE_ERROR);
+    EXPECT_EQ (err->code, (gint) GST_CORE_ERROR_NEGOTIATION);
+    g_clear_error (&err);
+    gst_message_unref (msg);
+  }
+
+  EXPECT_EQ (gst_harness_push (h, gst_harness_create_buffer (h, size)), GST_FLOW_NOT_NEGOTIATED);
+  EXPECT_EQ (sink.buffers, 1U);
+
+  _split_harness_bus_clear (h, bus);
+  gst_harness_teardown (h);
+  gst_pad_set_active (sinkpad, FALSE);
+  gst_object_unref (sinkpad);
+  if (sink.accepted)
+    gst_caps_unref (sink.accepted);
+}
+
+/**
+ * @brief Handler of "pad-added" linking src_N to the N-th pad of a NULL-terminated array.
+ */
+static void
+_split_link_pad_by_index (GstElement *element, GstPad *pad, gpointer user_data)
+{
+  GstPad **sinkpads = (GstPad **) user_data;
+  gchar *name = gst_pad_get_name (pad);
+  guint idx = (guint) g_ascii_strtoull (name + strlen ("src_"), NULL, 10);
+  guint num = 0;
+
+  UNUSED (element);
+
+  while (sinkpads[num] != NULL)
+    num++;
+  if (idx < num) {
+    EXPECT_EQ (gst_pad_link (pad, sinkpads[idx]), GST_PAD_LINK_OK);
+  }
+  g_free (name);
+}
+
+/**
+ * @brief A renegotiation one peer refuses leaves every source pad as it was.
+ * @details src_0 goes to a peer that would take the new type and src_1 to one
+ *          pinned to the old type. Every peer is asked before any pad changes,
+ *          so src_0 does not move ahead of src_1 into a type no buffer will
+ *          ever be pushed in, and its peer is not reconfigured for nothing.
+ */
+TEST (testTensorSplit, renegotiateRefusedLeavesEveryPad_n)
+{
+  GstHarness *h = gst_harness_new_with_padnames ("tensor_split", "sink", NULL);
+  splitAnySink open = { NULL, NULL, 0 };
+  splitPinnedSink pinned = { NULL, 0, 0 };
+  GstPad *sinkpads[] = { gst_pad_new ("open", GST_PAD_SINK),
+    gst_pad_new ("pinned", GST_PAD_SINK), NULL };
+  GstPad *srcpad;
+  GstMessage *msg;
+  GstCaps *caps;
+  GstBus *bus;
+  gsize size;
+
+  ASSERT_TRUE (h != NULL);
+  open.query_caps = gst_caps_from_string ("other/tensors");
+  gst_pad_set_event_function (sinkpads[0], _split_any_sink_event);
+  gst_pad_set_query_function (sinkpads[0], _split_any_sink_query);
+  gst_pad_set_chain_function (sinkpads[0], _split_any_sink_chain);
+  gst_pad_set_element_private (sinkpads[0], &open);
+  gst_pad_set_event_function (sinkpads[1], _split_pinned_sink_event);
+  gst_pad_set_query_function (sinkpads[1], _split_pinned_sink_query);
+  gst_pad_set_chain_function (sinkpads[1], _split_pinned_sink_chain);
+  gst_pad_set_element_private (sinkpads[1], &pinned);
+  gst_pad_set_active (sinkpads[0], TRUE);
+  gst_pad_set_active (sinkpads[1], TRUE);
+
+  bus = _split_harness_bus (h);
+  g_signal_connect (h->element, "pad-added", G_CALLBACK (_split_link_pad_by_index), sinkpads);
+  g_object_set (h->element, "tensorseg", "1:4:4,2:4:4", NULL);
+
+  size = _split_set_src_caps (h, "3:4:4", _NNS_UINT8, 0, 1);
+  EXPECT_EQ (gst_harness_push (h, gst_harness_create_buffer (h, size)), GST_FLOW_OK);
+  EXPECT_EQ (open.buffers, 1U);
+  EXPECT_EQ (pinned.buffers, 1U);
+
+  caps = _split_stream_caps ("3:4:4", _NNS_FLOAT32, 0, 1, &size);
+  gst_harness_push_event (h, gst_event_new_caps (caps));
+  gst_caps_unref (caps);
+  EXPECT_GT (pinned.refused, 0U);
+
+  msg = gst_bus_pop_filtered (bus, GST_MESSAGE_ERROR);
+  EXPECT_TRUE (msg != NULL);
+  if (msg)
+    gst_message_unref (msg);
+
+  srcpad = gst_element_get_static_pad (h->element, "src_0");
+  EXPECT_TRUE (srcpad != NULL);
+  if (srcpad) {
+    caps = gst_pad_get_current_caps (srcpad);
+    EXPECT_TRUE (caps != NULL);
+    if (caps) {
+      EXPECT_STREQ (gst_structure_get_string (gst_caps_get_structure (caps, 0), "types"), "uint8");
+      gst_caps_unref (caps);
+    }
+    gst_object_unref (srcpad);
+  }
+  EXPECT_TRUE (open.taken != NULL);
+  if (open.taken) {
+    EXPECT_STREQ (
+        gst_structure_get_string (gst_caps_get_structure (open.taken, 0), "types"), "uint8");
+  }
+
+  EXPECT_EQ (gst_harness_push (h, gst_harness_create_buffer (h, size)), GST_FLOW_NOT_NEGOTIATED);
+  EXPECT_EQ (open.buffers, 1U);
+  EXPECT_EQ (pinned.buffers, 1U);
+
+  _split_harness_bus_clear (h, bus);
+  gst_harness_teardown (h);
+  gst_pad_set_active (sinkpads[0], FALSE);
+  gst_pad_set_active (sinkpads[1], FALSE);
+  gst_object_unref (sinkpads[0]);
+  gst_object_unref (sinkpads[1]);
+  gst_caps_unref (open.query_caps);
+  if (open.taken)
+    gst_caps_unref (open.taken);
+  if (pinned.accepted)
+    gst_caps_unref (pinned.accepted);
+}
+
+/**
+ * @brief A picked segment reaching past the incoming tensor is refused.
+ * @details Only the picked segment is copied, but it starts after the segments
+ *          before it, so its end is what has to fit.
+ */
+TEST (testTensorSplit, tensorpickPastBuffer_n)
+{
+  splitPadOutput out[SPLIT_TEST_MAX_PADS] = {};
+  gsize size;
+  GstHarness *h = _split_harness_new ("2:8:8", out, &size);
+
+  g_object_set (h->element, "tensorseg", "1:8:8,2:8:8", "tensorpick", "1", NULL);
+  EXPECT_EQ (_split_push (h, size), GST_FLOW_ERROR);
+  EXPECT_EQ (out[0].buffers, 0U);
+
+  _split_outputs_clear (out);
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Run a pipeline until it ends.
+ * @return the type of the message it ended with, GST_MESSAGE_UNKNOWN on time-out
+ */
+static GstMessageType
+_split_run_pipeline (const gchar *description)
+{
+  GstElement *pipeline = gst_parse_launch (description, NULL);
+  GstMessageType type = GST_MESSAGE_UNKNOWN;
+  GstMessage *msg;
+  GstBus *bus;
+
+  if (pipeline == NULL)
+    return type;
+
+  setPipelineStateSync (pipeline, GST_STATE_PLAYING, UNITTEST_STATECHANGE_TIMEOUT);
+
+  bus = gst_element_get_bus (pipeline);
+  msg = gst_bus_timed_pop_filtered (bus, (GstClockTime) TEST_TIMEOUT_LIMIT * GST_USECOND,
+      (GstMessageType) (GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+  if (msg) {
+    type = GST_MESSAGE_TYPE (msg);
+    gst_message_unref (msg);
+  }
+
+  setPipelineStateSync (pipeline, GST_STATE_NULL, UNITTEST_STATECHANGE_TIMEOUT);
+  gst_object_unref (bus);
+  gst_object_unref (pipeline);
+  return type;
+}
+
+/**
+ * @brief A downstream element expecting the picked segment's shape gets it.
+ */
+TEST (testTensorSplit, tensorpickNegotiatesPickedSegment)
+{
+  const gchar *desc
+      = "videotestsrc num-buffers=2 ! "
+        "video/x-raw,format=RGB,width=4,height=4,framerate=30/1 ! "
+        "tensor_converter ! tensor_split tensorseg=1:4:4,2:4:4 tensorpick=1 ! "
+        "other/tensors,num_tensors=1,dimensions=2:4:4,types=uint8 ! fakesink";
+
+  EXPECT_EQ (_split_run_pipeline (desc), GST_MESSAGE_EOS);
+}
+
+/**
+ * @brief A downstream element expecting the first segment's shape is refused.
+ * @details The pad carries 32-byte buffers, so a 16-byte shape must not link.
+ */
+TEST (testTensorSplit, tensorpickRefusesFirstSegment_n)
+{
+  const gchar *desc
+      = "videotestsrc num-buffers=2 ! "
+        "video/x-raw,format=RGB,width=4,height=4,framerate=30/1 ! "
+        "tensor_converter ! tensor_split tensorseg=1:4:4,2:4:4 tensorpick=1 ! "
+        "other/tensors,num_tensors=1,dimensions=1:4:4,types=uint8 ! fakesink";
+
+  EXPECT_EQ (_split_run_pipeline (desc), GST_MESSAGE_ERROR);
 }
 
 /* set by _record_critical() when a critical is logged */
@@ -12193,6 +16218,333 @@ TEST (testTensorSplit, finalizeWithoutTensorseg)
   g_log_remove_handler ("GLib", glib_handler);
 
   EXPECT_FALSE (tensor_split_logged_critical);
+}
+
+/**
+ * @brief What went out of a tensor_split across its source pads.
+ */
+typedef struct {
+  guint buffers; /**< buffers pushed on any source pad */
+  gsize bytes; /**< bytes pushed on any source pad */
+  guint mismatched; /**< buffers of another size than the caps of their pad say */
+} splitRestartOutput;
+
+/**
+ * @brief Buffer probe counting what a tensor_split source pad pushes.
+ * @details The buffer is dropped, which the pad reports as a successful push,
+ *          so the element goes on to the next segment as if it were linked.
+ */
+static GstPadProbeReturn
+_split_restart_count (GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
+{
+  splitRestartOutput *out = (splitRestartOutput *) user_data;
+  gsize size = gst_buffer_get_size (GST_PAD_PROBE_INFO_BUFFER (info));
+  GstCaps *caps = gst_pad_get_current_caps (pad);
+  GstTensorsConfig config;
+
+  gst_tensors_config_init (&config);
+  if (caps == NULL || !gst_tensors_config_from_caps (&config, caps, TRUE)
+      || gst_tensors_info_get_size (&config.info, 0) != size)
+    out->mismatched++;
+  gst_tensors_config_free (&config);
+  if (caps)
+    gst_caps_unref (caps);
+
+  out->buffers++;
+  out->bytes += size;
+  return GST_PAD_PROBE_DROP;
+}
+
+/**
+ * @brief Handler of "pad-added", which puts the counting probe on the new pad.
+ */
+static void
+_split_restart_pad_added (GstElement *element, GstPad *pad, gpointer user_data)
+{
+  UNUSED (element);
+
+  gst_pad_add_probe (pad, GST_PAD_PROBE_TYPE_BUFFER, _split_restart_count, user_data, NULL);
+}
+
+/**
+ * @brief Start a stream of uint8 tensors of the given shape into a tensor_split harness.
+ * @details The sink pad forgets its sticky events when it is deactivated, so
+ *          a restarted element needs the stream to start over.
+ * @return bytes of one tensor of the stream
+ */
+static gsize
+_split_restart_start_stream (GstHarness *h, const gchar *dimension)
+{
+  GstTensorsConfig config;
+  gsize size;
+
+  gst_tensors_config_init (&config);
+  config.info.num_tensors = 1;
+  config.info.info[0].type = _NNS_UINT8;
+  gst_tensor_parse_dimension (dimension, config.info.info[0].dimension);
+  config.rate_n = 0;
+  config.rate_d = 1;
+
+  gst_harness_push_event (h, gst_event_new_stream_start ("split-restart"));
+  gst_harness_set_src_caps (h, gst_tensors_caps_from_config (&config));
+  size = gst_tensors_info_get_size (&config.info, 0);
+  gst_tensors_config_free (&config);
+
+  return size;
+}
+
+/**
+ * @brief Take the element down to READY and back, as a stopped and restarted pipeline does.
+ */
+static void
+_split_restart_cycle (GstHarness *h)
+{
+  EXPECT_EQ (gst_element_set_state (h->element, GST_STATE_READY), GST_STATE_CHANGE_SUCCESS);
+  EXPECT_EQ (gst_element_set_state (h->element, GST_STATE_PLAYING), GST_STATE_CHANGE_SUCCESS);
+}
+
+/**
+ * @brief A tensor_split taken to READY and back splits by the tensorseg it had.
+ * @details Going down to READY removes the source pads, and a restart has to
+ *          create them again, under the same names, from the rule that is
+ *          still set.
+ */
+TEST (testTensorSplit, restartKeepsTensorseg)
+{
+  GstHarness *h = gst_harness_new_with_padnames ("tensor_split", "sink", NULL);
+  splitRestartOutput out = { 0, 0, 0 };
+  GstPad *pad;
+  gsize size;
+
+  ASSERT_TRUE (h != NULL);
+  g_signal_connect (h->element, "pad-added", G_CALLBACK (_split_restart_pad_added), &out);
+  g_object_set (h->element, "tensorseg", "1:4:4,2:4:4", NULL);
+
+  size = _split_restart_start_stream (h, "3:4:4");
+  EXPECT_EQ (gst_harness_push (h, gst_harness_create_buffer (h, size)), GST_FLOW_OK);
+  EXPECT_EQ (out.buffers, 2U);
+  EXPECT_EQ (out.bytes, 48U);
+
+  _split_restart_cycle (h);
+  EXPECT_EQ ((guint) h->element->numsrcpads, 0U);
+
+  size = _split_restart_start_stream (h, "3:4:4");
+  EXPECT_EQ (gst_harness_push (h, gst_harness_create_buffer (h, size)), GST_FLOW_OK);
+  EXPECT_EQ (out.buffers, 4U);
+  EXPECT_EQ (out.bytes, 96U);
+  EXPECT_EQ (out.mismatched, 0U);
+  EXPECT_EQ ((guint) h->element->numsrcpads, 2U);
+
+  pad = gst_element_get_static_pad (h->element, "src_0");
+  EXPECT_TRUE (pad != NULL);
+  if (pad)
+    gst_object_unref (pad);
+  pad = gst_element_get_static_pad (h->element, "src_1");
+  EXPECT_TRUE (pad != NULL);
+  if (pad)
+    gst_object_unref (pad);
+
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Handler of "no-more-pads" counting how many times the element reported it.
+ */
+static void
+_split_restart_no_more_pads (GstElement *element, gpointer user_data)
+{
+  UNUSED (element);
+
+  (*(guint *) user_data)++;
+}
+
+/**
+ * @brief A restarted tensor_split still outputs only the picked segment.
+ * @details The pads made for the pick are counted from zero again, so the
+ *          element reports that it has no more pads once per run. The pick
+ *          starts at segment 0, whose pad is described the same way with or
+ *          without the fix for #4927.
+ */
+TEST (testTensorSplit, restartKeepsTensorpick)
+{
+  GstHarness *h = gst_harness_new_with_padnames ("tensor_split", "sink", NULL);
+  splitRestartOutput out = { 0, 0, 0 };
+  guint no_more_pads = 0;
+  GstPad *pad;
+  gsize size;
+
+  ASSERT_TRUE (h != NULL);
+  g_signal_connect (h->element, "pad-added", G_CALLBACK (_split_restart_pad_added), &out);
+  g_signal_connect (h->element, "no-more-pads",
+      G_CALLBACK (_split_restart_no_more_pads), &no_more_pads);
+  g_object_set (h->element, "tensorseg", "1:4:4,2:4:4", "tensorpick", "0", NULL);
+
+  size = _split_restart_start_stream (h, "3:4:4");
+  EXPECT_EQ (gst_harness_push (h, gst_harness_create_buffer (h, size)), GST_FLOW_OK);
+  EXPECT_EQ (out.buffers, 1U);
+  EXPECT_EQ (out.bytes, 16U);
+  EXPECT_EQ (no_more_pads, 1U);
+
+  _split_restart_cycle (h);
+
+  size = _split_restart_start_stream (h, "3:4:4");
+  EXPECT_EQ (gst_harness_push (h, gst_harness_create_buffer (h, size)), GST_FLOW_OK);
+  EXPECT_EQ (out.buffers, 2U);
+  EXPECT_EQ (out.bytes, 32U);
+  EXPECT_EQ (out.mismatched, 0U);
+  EXPECT_EQ (no_more_pads, 2U);
+  EXPECT_EQ ((guint) h->element->numsrcpads, 1U);
+
+  pad = gst_element_get_static_pad (h->element, "src_0");
+  EXPECT_TRUE (pad != NULL);
+  if (pad)
+    gst_object_unref (pad);
+
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief A tensorseg refused while the stream ran is taken in READY.
+ * @details Stopping the element is how the rule is changed: the source pads go
+ *          away on the way down, and the next stream gets new ones, made from
+ *          the rule that was set in between.
+ */
+TEST (testTensorSplit, setTensorsegInReady)
+{
+  GstHarness *h = gst_harness_new_with_padnames ("tensor_split", "sink", NULL);
+  splitRestartOutput out = { 0, 0, 0 };
+  gsize size;
+
+  ASSERT_TRUE (h != NULL);
+  g_signal_connect (h->element, "pad-added", G_CALLBACK (_split_restart_pad_added), &out);
+  g_object_set (h->element, "tensorseg", "1:4:4,2:4:4", NULL);
+
+  size = _split_restart_start_stream (h, "3:4:4");
+  EXPECT_EQ (gst_harness_push (h, gst_harness_create_buffer (h, size)), GST_FLOW_OK);
+  EXPECT_EQ (out.buffers, 2U);
+  EXPECT_EQ (out.bytes, 48U);
+
+  g_object_set (h->element, "tensorseg", "3:4:4", NULL);
+  EXPECT_EQ (_split_count_tensorseg (h->element), 2U);
+
+  _split_restart_cycle (h);
+  g_object_set (h->element, "tensorseg", "3:4:4", NULL);
+  EXPECT_EQ (_split_count_tensorseg (h->element), 1U);
+
+  size = _split_restart_start_stream (h, "3:4:4");
+  EXPECT_EQ (gst_harness_push (h, gst_harness_create_buffer (h, size)), GST_FLOW_OK);
+  EXPECT_EQ (out.buffers, 3U);
+  EXPECT_EQ (out.bytes, 96U);
+  EXPECT_EQ (out.mismatched, 0U);
+  EXPECT_EQ ((guint) h->element->numsrcpads, 1U);
+
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief A restarted tensor_split still refuses a tensor its tensorseg does not fit.
+ * @details The rule kept across the restart asks for 48 bytes, and the new
+ *          stream only brings 12, so the buffer has to be refused rather than
+ *          passed over without a word.
+ */
+TEST (testTensorSplit, restartRefusesSmallerTensor_n)
+{
+  GstHarness *h = gst_harness_new_with_padnames ("tensor_split", "sink", NULL);
+  splitRestartOutput out = { 0, 0, 0 };
+  gsize size;
+
+  ASSERT_TRUE (h != NULL);
+  g_signal_connect (h->element, "pad-added", G_CALLBACK (_split_restart_pad_added), &out);
+  g_object_set (h->element, "tensorseg", "1:4:4,2:4:4", NULL);
+
+  size = _split_restart_start_stream (h, "3:4:4");
+  EXPECT_EQ (gst_harness_push (h, gst_harness_create_buffer (h, size)), GST_FLOW_OK);
+  EXPECT_EQ (out.buffers, 2U);
+
+  _split_restart_cycle (h);
+
+  size = _split_restart_start_stream (h, "3:2:2");
+  EXPECT_EQ (gst_harness_push (h, gst_harness_create_buffer (h, size)), GST_FLOW_ERROR);
+  EXPECT_EQ (out.buffers, 2U);
+
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Handler of "pad-added" linking the first source pad to the sink, as an application does.
+ */
+static void
+_split_restart_link_pad (GstElement *element, GstPad *pad, gpointer user_data)
+{
+  GstPad *sinkpad = gst_element_get_static_pad (GST_ELEMENT (user_data), "sink");
+
+  UNUSED (element);
+
+  if (!gst_pad_is_linked (sinkpad)) {
+    EXPECT_EQ (gst_pad_link (pad, sinkpad), GST_PAD_LINK_OK);
+  }
+  gst_object_unref (sinkpad);
+}
+
+/**
+ * @brief Play a pipeline until it ends.
+ * @return the type of the message it ended with, GST_MESSAGE_UNKNOWN on time-out
+ */
+static GstMessageType
+_split_restart_play (GstElement *pipeline)
+{
+  GstBus *bus = gst_element_get_bus (pipeline);
+  GstMessageType type = GST_MESSAGE_UNKNOWN;
+  GstMessage *msg;
+
+  gst_element_set_state (pipeline, GST_STATE_PLAYING);
+  msg = gst_bus_timed_pop_filtered (bus, (GstClockTime) TEST_TIMEOUT_LIMIT * GST_USECOND,
+      (GstMessageType) (GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+  if (msg) {
+    type = GST_MESSAGE_TYPE (msg);
+    gst_message_unref (msg);
+  }
+  gst_object_unref (bus);
+
+  return type;
+}
+
+/**
+ * @brief A pipeline stopped to NULL and played again gets its tensors again.
+ * @details The source pads go away when the pipeline stops, so the new ones
+ *          are linked from "pad-added" again, the way an application does it.
+ */
+TEST (testTensorSplit, replayPipeline)
+{
+  GstElement *pipeline, *split, *sink;
+  guint data_received = 0;
+
+  pipeline = gst_parse_launch ("videotestsrc num-buffers=2 ! "
+                               "video/x-raw,format=RGB,width=4,height=4,framerate=30/1 ! "
+                               "tensor_converter ! tensor_split name=split tensorseg=1:4:4,2:4:4 "
+                               "tensor_sink name=sinkx",
+      NULL);
+  ASSERT_TRUE (pipeline != NULL);
+
+  split = gst_bin_get_by_name (GST_BIN (pipeline), "split");
+  sink = gst_bin_get_by_name (GST_BIN (pipeline), "sinkx");
+  ASSERT_TRUE (split != NULL);
+  ASSERT_TRUE (sink != NULL);
+
+  g_signal_connect (split, "pad-added", G_CALLBACK (_split_restart_link_pad), sink);
+  g_signal_connect (sink, "new-data", G_CALLBACK (count_output), &data_received);
+
+  EXPECT_EQ (_split_restart_play (pipeline), GST_MESSAGE_EOS);
+  EXPECT_EQ (setPipelineStateSync (pipeline, GST_STATE_NULL, UNITTEST_STATECHANGE_TIMEOUT), 0);
+  EXPECT_EQ (data_received, 2U);
+
+  EXPECT_EQ (_split_restart_play (pipeline), GST_MESSAGE_EOS);
+  EXPECT_EQ (setPipelineStateSync (pipeline, GST_STATE_NULL, UNITTEST_STATECHANGE_TIMEOUT), 0);
+  EXPECT_EQ (data_received, 4U);
+
+  gst_object_unref (sink);
+  gst_object_unref (split);
+  gst_object_unref (pipeline);
 }
 
 /**
@@ -12613,14 +16965,13 @@ TEST (testTensorDecoder, pushFlexibleInputUnknownVersion_n)
    * Keep the magic and raise the major of the version. The version marker and
    * the major live in the second word of the header; both encodings are
    * private to nnstreamer_plugin_api_util_impl.c, so the assertions below pin
-   * what this literal has to mean: a header that still validates, of a version
-   * whose layout cannot be sized. Without them a changed encoding would leave
-   * the case passing on the parse failure before the branch under test.
+   * what this literal has to mean: a header of a version whose layout cannot
+   * be sized, which the parser refuses since item A7 of #4920.
    */
   ASSERT_TRUE (gst_buffer_map (buf, &map, GST_MAP_WRITE));
   ((uint32_t *) map.data)[1] = 0xDE002000U;
 
-  EXPECT_TRUE (gst_tensor_meta_info_parse_header (&meta, map.data));
+  EXPECT_FALSE (gst_tensor_meta_info_parse_header (&meta, map.data));
   EXPECT_TRUE (gst_tensor_meta_info_get_version (&meta, &major, NULL));
   EXPECT_NE (major, 1U);
   EXPECT_EQ (gst_tensor_meta_info_get_header_size (&meta), 0U);
@@ -12681,6 +17032,47 @@ TEST (testTensorDecoder, pushDirectVideoInputSizeTooLarge_n)
 
   EXPECT_EQ (gst_harness_push (h, gst_harness_create_buffer (h, data_size * 64)), GST_FLOW_ERROR);
 
+  gst_tensors_config_free (&config);
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief octet_stream hands a tensor on as its bytes.
+ * @details The bytes are a copy the output memory owns; the valgrind step of
+ *          CI reports that copy as a leak if the memory does not free it.
+ */
+TEST (testTensorDecoder, pushOctetStream)
+{
+  GstTensorsConfig config;
+  GstHarness *h;
+  GstBuffer *in_buf, *out_buf;
+  GstMapInfo map;
+  gsize data_size, i, mismatch = 0;
+
+  _get_decoder_config (&config);
+  h = _get_decoder_harness ("octet_stream", NULL, &config);
+  ASSERT_TRUE (h != NULL);
+
+  data_size = gst_tensors_info_get_size (&config.info, 0);
+  in_buf = gst_harness_create_buffer (h, data_size);
+  ASSERT_TRUE (gst_buffer_map (in_buf, &map, GST_MAP_WRITE));
+  for (i = 0; i < data_size; i++)
+    map.data[i] = (guint8) i;
+  gst_buffer_unmap (in_buf, &map);
+
+  EXPECT_EQ (gst_harness_push (h, in_buf), GST_FLOW_OK);
+  out_buf = gst_harness_pull (h);
+  ASSERT_TRUE (out_buf != NULL);
+  EXPECT_EQ (gst_buffer_get_size (out_buf), data_size);
+
+  ASSERT_TRUE (gst_buffer_map (out_buf, &map, GST_MAP_READ));
+  for (i = 0; i < map.size; i++)
+    if (map.data[i] != (guint8) i)
+      mismatch++;
+  gst_buffer_unmap (out_buf, &map);
+  EXPECT_EQ (mismatch, 0U);
+
+  gst_buffer_unref (out_buf);
   gst_tensors_config_free (&config);
   gst_harness_teardown (h);
 }

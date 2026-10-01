@@ -68,7 +68,7 @@ The GStreamer pad capability of ```other/tensors``` is as follows:
 ```
 other/tensors
     format = {static, flexible, sparse}
-    num_tensors = (int) [1, 16]  # GST_MAX_MEMCHUNK_PER_BUFFER
+    num_tensors = (int) [1, 256]  # NNS_TENSOR_SIZE_LIMIT
     framerate = (fraction) [0/1, 2147483647/1]
     types = (string) Typestrings # Ignored with flexible and sparse
     dimensions = (string) Dimensions # Ignored with flexible and sparse
@@ -107,6 +107,8 @@ This is useful when an element or a model requires non-determined, dynamic data 
 Unlike ```other/tensors,format=static```, flexible tensor does not contain the data structure in pad capability; thus, the properties of dimensions and types are ignored.
 An ```other/tensors,format=flexible``` tensor has its meta data - [GstTensorMetaInfo](https://github.com/nnstreamer/nnstreamer/blob/main/gst/nnstreamer/include/tensor_typedef.h) - in each tensor buffer, to prevent caps negotiation with fixed type of data stream.
 When processing a buffer with the capability ```other/tensors,format=flexible```, NNStreamer engine developer (not pipeline or application developers) should append or parse the tensor information in buffer using various [utility functions](https://github.com/nnstreamer/nnstreamer/blob/main/gst/nnstreamer/include/nnstreamer_plugin_api_util.h). Note that there are a few [other functions defined in another header](https://github.com/nnstreamer/nnstreamer/blob/main/gst/nnstreamer/include/nnstreamer_plugin_api.h): appending and parsing headers of GstMemory objects.
+
+A ```tensor_filter``` with flexible input stops the stream with an error when a tensor's meta is invalid, does not describe the data after it, or is tagged sparse. Without ```invoke-dynamic=true```, each tensor must also have the type and dimension of the configured input (the model's, or the ```input``` and ```inputtype``` properties). Only with ```invoke-dynamic=true``` may the flexible tensors change type or shape per buffer; the subplugin then decides what it accepts. Note that ```tensor_converter``` turns ```application/octet-stream``` into a ```uint8``` tensor of the buffer size; set its ```input-dim``` and ```input-type``` to feed a model of another type or shape.
 
 The buffer of ```other/tensors,format=flexible``` may have single memory or multiple memory chunks.
 NNStreamer element with ```other/tensors,format=flexible``` capability gets the number of memories in a buffer and handles each memory as a tensor.

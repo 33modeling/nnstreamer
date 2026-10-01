@@ -92,9 +92,16 @@ class tensor_filter_cpp
   static std::unordered_map<std::string, tensor_filter_cpp *> filters;
   static std::vector<void *> handles;
   static bool close_all_called;
+  class prop_scope; /**< Sets prop to the caller's properties for one callback */
 
   protected:
-  const GstTensorFilterProperties *prop;
+  static thread_local const GstTensorFilterProperties *prop;
+  /**< Properties of the tensor_filter whose getInputDim, getOutputDim,
+       setInputDim or invoke call is running on this thread.
+       It is nullptr everywhere else: in any other method, including
+       isAllocatedBeforeInvoke, and on threads of your own that one of
+       those four calls may start. Read it only in those four calls,
+       and copy what you need from it if you pass it on. */
 
   public:
   tensor_filter_cpp (
@@ -119,7 +126,8 @@ class tensor_filter_cpp
   /**< return true if you want nnstreamer to preallocate output buffers
        before calling invoke. This value should be configured at the
        constructor and cannot be changed afterwards.
-       This should not change its return values. */
+       This should not change its return values.
+       prop is not available here; the answer may not depend on it. */
 
   /** API. Do not override. */
   static int __register (class tensor_filter_cpp *filter, unsigned int ref_count = 0);
@@ -160,6 +168,8 @@ class tensor_filter_cpp
   /** @brief tensor_filter callback dispatching invoke to the instance */
   static int invoke (const GstTensorFilterProperties *prop, void **private_data,
       const GstTensorMemory *input, GstTensorMemory *output);
+  /** @brief tensor_filter callback telling whether this instance allocates its output in invoke */
+  static int allocateInInvoke (void **private_data);
   /** @brief tensor_filter callback opening the filter given by model prop */
   static int open (const GstTensorFilterProperties *prop, void **private_data);
   /** @brief tensor_filter callback releasing a reference to the filter */

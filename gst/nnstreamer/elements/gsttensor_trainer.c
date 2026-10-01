@@ -318,6 +318,15 @@ gst_tensor_trainer_finalize (GObject * object)
   GstTensorTrainer *trainer;
   trainer = GST_TENSOR_TRAINER (object);
 
+  if (trainer->dummy_data_thread) {
+    g_thread_join (trainer->dummy_data_thread);
+    trainer->dummy_data_thread = NULL;
+  }
+
+  if (trainer->fw_created && trainer->fw) {
+    trainer->fw->destroy (trainer->fw, &trainer->prop, &trainer->privateData);
+  }
+
   g_free (trainer->fw_name);
   g_free ((char *) trainer->prop.model_config);
   g_free ((char *) trainer->prop.model_save_path);
@@ -331,14 +340,7 @@ gst_tensor_trainer_finalize (GObject * object)
   g_cond_clear (&trainer->epoch_completion_cond);
   g_mutex_clear (&trainer->epoch_completion_lock);
 
-  if (trainer->dummy_data_thread) {
-    g_thread_join (trainer->dummy_data_thread);
-    trainer->dummy_data_thread = NULL;
-  }
-
-  if (trainer->fw_created && trainer->fw) {
-    trainer->fw->destroy (trainer->fw, &trainer->prop, &trainer->privateData);
-  }
+  gst_tensors_info_free (&trainer->prop.input_meta);
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
@@ -521,6 +523,7 @@ gst_tensor_trainer_change_state (GstElement * element,
       GST_INFO_OBJECT (trainer, "NULL_TO_READY");
       /* currently not used */
       trainer->is_training_complete = FALSE;
+      trainer->extra_tensors_warned = FALSE;
       break;
 
     case GST_STATE_CHANGE_READY_TO_PAUSED:
@@ -553,6 +556,8 @@ gst_tensor_trainer_change_state (GstElement * element,
         if (!g_strcmp0 (trainer->fw_name, "nntrainer")) {
           GST_INFO_OBJECT (trainer, "cur_epoch_data_cnt=%u",
               trainer->cur_epoch_data_cnt);
+          if (trainer->dummy_data_thread)
+            g_thread_join (trainer->dummy_data_thread);
           trainer->dummy_data_thread =
               g_thread_new ("dumy_data_generation_func",
               (GThreadFunc) gst_tensor_trainer_dummy_data_generation_func,
@@ -652,8 +657,27 @@ gst_tensor_trainer_check_chain_conditions (GstTensorTrainer * trainer,
       return FALSE;
   }
 
-  if (num_tensors >= NNS_TENSOR_SIZE_LIMIT)
+  if (num_tensors >= NNS_TENSOR_SIZE_LIMIT) {
+    GST_ERROR_OBJECT (trainer, "The buffer has too many tensors (%u)",
+        num_tensors);
     return FALSE;
+  }
+
+  if (num_tensors < trainer->prop.num_inputs + trainer->prop.num_labels) {
+    GST_ERROR_OBJECT (trainer,
+        "The buffer has %u tensors, fewer than num-inputs (%u) + num-labels (%u)",
+        num_tensors, trainer->prop.num_inputs, trainer->prop.num_labels);
+    return FALSE;
+  }
+
+  if (!trainer->extra_tensors_warned &&
+      num_tensors > trainer->prop.num_inputs + trainer->prop.num_labels) {
+    GST_WARNING_OBJECT (trainer,
+        "The buffer has %u tensors, more than num-inputs (%u) + num-labels (%u); "
+        "the extra tensors are not used as inputs or labels",
+        num_tensors, trainer->prop.num_inputs, trainer->prop.num_labels);
+    trainer->extra_tensors_warned = TRUE;
+  }
 
   return TRUE;
 }
@@ -663,11 +687,14 @@ gst_tensor_trainer_check_chain_conditions (GstTensorTrainer * trainer,
  */
 static gsize
 gst_tensor_trainer_convert_meta (GstTensorTrainer * trainer,
-    GstTensorMetaInfo * meta, GstTensorInfo * info, void *data)
+    GstTensorMetaInfo * meta, GstTensorInfo * info, void *data, gsize size)
 {
   gsize header_size = 0;
 
-  if (!gst_tensor_meta_info_parse_header (meta, data)) {
+  gst_tensor_meta_info_init (meta);
+
+  if (size < gst_tensor_meta_info_get_header_size (meta) ||
+      !gst_tensor_meta_info_parse_header (meta, data)) {
     GST_ERROR_OBJECT (trainer, "Invalid Flexible tensors");
     return 0;
   }
@@ -714,13 +741,15 @@ gst_tensor_trainer_push_input (GstTensorTrainer * trainer, GstBuffer * inbuf,
     in_mem[i] = gst_tensor_buffer_get_nth_memory (inbuf, i);
     if (!gst_memory_map (in_mem[i], &in_info[i], GST_MAP_READ)) {
       GST_ERROR_OBJECT (trainer, "Could not map in_mem[%u] GstMemory", i);
+      gst_memory_unref (in_mem[i]);
+      in_mem[i] = NULL;
       goto error;
     }
 
     if (in_flexible) {
       info = gst_tensors_info_get_nth_info (&trainer->prop.input_meta, i);
       header_size = gst_tensor_trainer_convert_meta (trainer,
-          &in_meta[i], info, in_info[i].data);
+          &in_meta[i], info, in_info[i].data, in_info[i].size);
       if (header_size == 0)
         goto error;
     }
@@ -1010,12 +1039,15 @@ gst_tensor_trainer_sink_event (GstPad * sinkpad, GstObject * parent,
       }
 
       /* copy TensorsInfo from negotiated caps to GstTensorTrainerProperties's input_meta */
+      gst_tensors_info_free (&trainer->prop.input_meta);
       gst_tensors_info_copy (&trainer->prop.input_meta, &config.info);
 
       /* set tensor-config and out caps */
+      gst_tensors_config_free (&trainer->in_config);
       trainer->in_config = config;
       trainer->out_config.rate_n = config.rate_n;
       trainer->out_config.rate_d = config.rate_d;
+      gst_tensors_info_free (&trainer->out_config.info);
       gst_tensors_info_copy (&trainer->out_config.info, &trainer->output_meta);
 
       out_caps =

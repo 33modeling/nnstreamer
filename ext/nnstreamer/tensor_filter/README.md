@@ -13,6 +13,11 @@ You can embed arbitrary function calls in a nnstreamer pipeline with these subpl
 ### Custom/C Simplified (custom-easy)
 ### Lua
 ### Python3
+- subplugin name: 'python3'
+
+The model is a python script defining the class ```CustomFilter``` with either ```getInputDim()``` and ```getOutputDim()```, or ```setInputDim()```, and ```invoke(input_array)```. ```tests/test_models/models/passthrough.py``` is an example. The custom property is split by spaces into the arguments of the class constructor.
+
+```invoke()``` gets a list of 1-D numpy arrays, one for each input tensor, and returns a list of numpy arrays, one for each output tensor, each with the type and the byte size of its tensor. An output array is copied before it is pushed if it is not contiguous, if its data lies in an input tensor, or if its data pointer is the same as that of an output already given out. Any other array is pushed without a copy, including a read-only array and a view overlapping another output, so an element after tensor\_filter must not write into such an output. Any other result, or an exception, fails the invoke and the stream stops with an error.
 
 ## Neural network frameworks
 
@@ -25,13 +30,8 @@ You can insert model files and their frameworks in a nnstreamer pipeline with th
 ### Tensorflow-lite
 - subplugin name: 'tensorflow1-lite'
 - subplugin name: 'tensorflow2-lite'
-- subplugin name: 'tensorflow2-lite-custom'
 
-#### How to use custom tensorflow-lite binaries
-
-If you want to use tensorflow-lite custom operators with your own tensorflow-lite custom binaries, you can use tensorflow2-lite-custom subplugin. As its name suggests, this supports tensorflow-lite 2.x versions.
-
-By default, this subplugin loads ```./libtensorflow2-lite-custom.so```, which is the user's custom tensorflow-lite binary.
+The former ```tensorflow2-lite-custom``` subplugin, which used a custom tensorflow-lite binary, is removed (#4268); use ```tensorflow2-lite``` instead. Its meson option ```tflite2-custom-support``` is kept only so that existing build scripts passing it keep configuring. The option selects nothing, and ```-Dtflite2-custom-support=enabled``` is rejected at ```meson setup```. The option itself will be removed later (#4978), so drop it from build scripts.
 
 ### LiteRT
 - subplugin name: 'litert'

@@ -8,6 +8,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <errno.h>
 #include <glib.h>
 #include <glib/gstdio.h>
 #include <gst/app/gstappsrc.h>
@@ -305,6 +306,124 @@ static void
 _count_glib_critical (const gchar *, GLogLevelFlags, const gchar *, gpointer)
 {
   glib_critical_cnt++;
+}
+
+static guint overflow_log_cnt = 0;
+
+/**
+ * @brief Log handler counting the overflow reports of the option parsers
+ */
+static void
+_count_overflow_log (const gchar *, GLogLevelFlags, const gchar *message, gpointer)
+{
+  if (message && g_strrstr (message, "Overflow occurred"))
+    overflow_log_cnt++;
+}
+
+/**
+ * @brief Set the option properties of @a tif and count the overflow reports.
+ */
+static guint
+_set_options_with_errno (GstElement *tif, const gchar *cv_option, const gchar *option, int err)
+{
+  GLogFunc prev_handler;
+
+  overflow_log_cnt = 0;
+  prev_handler = g_log_set_default_handler (_count_overflow_log, NULL);
+
+  errno = err;
+  g_object_set (tif, "then-option", option, NULL);
+  errno = err;
+  g_object_set (tif, "else-option", option, NULL);
+  errno = err;
+  g_object_set (tif, "compared-value-option", cv_option, NULL);
+
+  g_log_set_default_handler (prev_handler, NULL);
+
+  return overflow_log_cnt;
+}
+
+/**
+ * @brief Whether ml_loge () reaches the log domain the handler above hooks.
+ * @details ml_loge () is g_critical () in a Linux distro build, but dlog on
+ *          Tizen and logcat on Android, where the handler counts nothing. The
+ *          decision is made at compile time on purpose: asking the parser under
+ *          test would let a future loss of the overflow report skip the cases
+ *          below instead of failing them.
+ */
+#if defined(__TIZEN__) || defined(__ANDROID__)
+#define ML_LOGE_REACHES_GLIB 0
+#else
+#define ML_LOGE_REACHES_GLIB 1
+#endif
+
+/**
+ * @brief Test that the option parsers of tensor_if ignore a stale errno
+ */
+TEST (tensorIfProp, optionStaleErrno)
+{
+#if !ML_LOGE_REACHES_GLIB
+  GTEST_SKIP () << "ml_loge () does not reach the GLib log domain here";
+#endif
+  GstElement *tif = gst_element_factory_make ("tensor_if", NULL);
+  gchar *str_val = NULL;
+
+  ASSERT_NE (tif, nullptr);
+
+  EXPECT_EQ (0U, _set_options_with_errno (tif, "1:2:1:1,1", "0,1", ERANGE));
+
+  g_object_get (tif, "then-option", &str_val, NULL);
+  EXPECT_STREQ ("0,1", str_val);
+  g_free (str_val);
+
+  g_object_get (tif, "else-option", &str_val, NULL);
+  EXPECT_STREQ ("0,1", str_val);
+  g_free (str_val);
+
+  g_object_get (tif, "compared-value-option", &str_val, NULL);
+  EXPECT_TRUE (gst_tensor_dimension_string_is_equal ("1:2:1:1,1", str_val));
+  g_free (str_val);
+
+  gst_object_unref (tif);
+}
+
+/**
+ * @brief Test that the option parsers of tensor_if still report a real overflow (negative)
+ */
+TEST (tensorIfProp, optionOverflow_n)
+{
+#if !ML_LOGE_REACHES_GLIB
+  GTEST_SKIP () << "ml_loge () does not reach the GLib log domain here";
+#endif
+  GstElement *tif = gst_element_factory_make ("tensor_if", NULL);
+
+  ASSERT_NE (tif, nullptr);
+
+  EXPECT_EQ (3U, _set_options_with_errno (tif, "1:2:1:1,99999999999999999999",
+                     "99999999999999999999", 0));
+
+  gst_object_unref (tif);
+}
+
+/**
+ * @brief Test that tensor_if keeps a compared-value option it refuses (negative)
+ */
+TEST (tensorIfProp, optionTooManyFields_n)
+{
+  GstElement *tif = gst_element_factory_make ("tensor_if", NULL);
+  gchar *str_val = NULL;
+
+  ASSERT_NE (tif, nullptr);
+
+  g_object_set (tif, "compared-value-option", "1:2:1:1,1", NULL);
+  /* it should be in the form of 'IDX_DIM0: ... :INDEX_DIM_LAST,nth-tensor' */
+  g_object_set (tif, "compared-value-option", "1:2,3,4", NULL);
+
+  g_object_get (tif, "compared-value-option", &str_val, NULL);
+  EXPECT_TRUE (gst_tensor_dimension_string_is_equal ("1:2:1:1,1", str_val));
+  g_free (str_val);
+
+  gst_object_unref (tif);
 }
 
 /**
@@ -1120,6 +1239,598 @@ TEST (tensorIfCustom, invalidParam2_n)
 TEST (tensorIfCustom, invalidParam3_n)
 {
   EXPECT_NE (0, nnstreamer_if_custom_unregister ("tifx"));
+}
+
+/**
+ * @brief Callback counting the buffers that reach the sink.
+ */
+static void
+count_data_cb (GstElement *element, GstBuffer *buffer, gpointer user_data)
+{
+  guint *received = (guint *) user_data;
+
+  *received = *received + 1;
+}
+
+/**
+ * @brief Caps and size of the test frame test_frames[0].
+ */
+#define TEST_FRAME_CAPS \
+  "other/tensor,dimension=(string)3:4:2:2,type=(string)int32,framerate=(fraction)0/1"
+#define TEST_FRAME_SIZE (192U)
+
+/**
+ * @brief Push the first bytes of test_frames[0] as one buffer through a tensor_if.
+ * @param caps the caps the buffer is pushed with
+ * @param size the size of the buffer, at most TEST_FRAME_SIZE
+ * @param if_props the properties of the tensor_if element under test
+ * @param error_src name of the element the first bus error came from, or NULL
+ * @param error the first bus error, or NULL
+ * @param received number of the buffers that reached the sink
+ * @return the first bus message type, GST_MESSAGE_ANY if the pipeline could not
+ * be built and GST_MESSAGE_UNKNOWN if neither an error nor EOS arrived in time.
+ */
+static GstMessageType
+_push_if_frame (const gchar *caps, gsize size, const gchar *if_props,
+    gchar **error_src, GError **error, guint *received)
+{
+  GstElement *pipeline, *appsrc_handle, *sink_handle;
+  GstBuffer *buf;
+  GstBus *bus;
+  GstMessage *msg;
+  GstMessageType type = GST_MESSAGE_UNKNOWN;
+  gchar *str_pipeline;
+
+  *error_src = NULL;
+  *error = NULL;
+  *received = 0;
+
+  str_pipeline = g_strdup_printf ("appsrc name=appsrc ! %s ! tensor_if name=tif %s ! "
+                                  "tensor_sink name=sinkx async=false",
+      caps, if_props);
+
+  pipeline = gst_parse_launch (str_pipeline, NULL);
+  g_free (str_pipeline);
+  if (pipeline == NULL)
+    return GST_MESSAGE_ANY;
+
+  appsrc_handle = gst_bin_get_by_name (GST_BIN (pipeline), "appsrc");
+  sink_handle = gst_bin_get_by_name (GST_BIN (pipeline), "sinkx");
+  g_signal_connect (sink_handle, "new-data", (GCallback) count_data_cb, received);
+
+  buf = gst_buffer_new_allocate (NULL, size, NULL);
+  gst_buffer_fill (buf, 0, test_frames[0], size);
+
+  setPipelineStateSync (pipeline, GST_STATE_PLAYING, UNITTEST_STATECHANGE_TIMEOUT);
+  gst_app_src_push_buffer (GST_APP_SRC (appsrc_handle), buf);
+  gst_app_src_end_of_stream (GST_APP_SRC (appsrc_handle));
+
+  bus = gst_element_get_bus (pipeline);
+  msg = gst_bus_timed_pop_filtered (bus, 5 * GST_SECOND,
+      (GstMessageType) (GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
+  if (msg) {
+    type = GST_MESSAGE_TYPE (msg);
+    if (type == GST_MESSAGE_ERROR) {
+      *error_src = g_strdup (GST_OBJECT_NAME (GST_MESSAGE_SRC (msg)));
+      gst_message_parse_error (msg, error, NULL);
+    }
+    gst_message_unref (msg);
+  }
+  gst_object_unref (bus);
+
+  setPipelineStateSync (pipeline, GST_STATE_NULL, UNITTEST_STATECHANGE_TIMEOUT);
+
+  gst_object_unref (sink_handle);
+  gst_object_unref (appsrc_handle);
+  gst_object_unref (pipeline);
+
+  return type;
+}
+
+/**
+ * @brief Push one buffer through tensor_if compared-value=A_VALUE.
+ * @param caps the caps the buffer is pushed with
+ * @param size the size of the buffer
+ * @param cv_option the compared-value-option to test
+ * @param supplied_value the value the element compares the picked element with
+ * @param error_src name of the element the first bus error came from, or NULL
+ * @param error the first bus error, or NULL
+ * @param received number of the buffers that reached the sink
+ * @return the first bus message type, as _push_if_frame() returns it.
+ */
+static GstMessageType
+_push_a_value_frame (const gchar *caps, gsize size, const gchar *cv_option,
+    const gchar *supplied_value, gchar **error_src, GError **error, guint *received)
+{
+  GstMessageType type;
+  gchar *if_props = g_strdup_printf ("compared-value=A_VALUE compared-value-option=%s supplied-value=%s "
+                                     "operator=EQ then=PASSTHROUGH else=SKIP",
+      cv_option, supplied_value);
+
+  type = _push_if_frame (caps, size, if_props, error_src, error, received);
+  g_free (if_props);
+
+  return type;
+}
+
+/**
+ * @brief Check that tensor_if refused the buffer instead of reading out of bounds.
+ */
+static void
+_expect_refused_cv_option (const gchar *caps, gsize size, const gchar *cv_option)
+{
+  gchar *error_src = NULL;
+  GError *error = NULL;
+  guint received = 0;
+
+  EXPECT_EQ (GST_MESSAGE_ERROR, _push_a_value_frame (caps, size, cv_option,
+                                    "1224", &error_src, &error, &received));
+  EXPECT_STREQ ("tif", error_src);
+  ASSERT_NE (error, nullptr);
+  EXPECT_EQ (GST_STREAM_ERROR, error->domain);
+  EXPECT_EQ (GST_STREAM_ERROR_WRONG_TYPE, error->code);
+  EXPECT_EQ (0U, received);
+
+  g_clear_error (&error);
+  g_free (error_src);
+}
+
+/**
+ * @brief Check that caps declaring a tensor whose byte size overflows are refused.
+ * @note The size of such a tensor cannot be computed, so the caps fail to
+ * negotiate before tensor_if computes the offset of the compared element.
+ */
+static void
+_expect_refused_overflow_caps (const gchar *caps, gsize size, const gchar *cv_option)
+{
+  gchar *error_src = NULL;
+  GError *error = NULL;
+  guint received = 0;
+
+  EXPECT_EQ (GST_MESSAGE_ERROR, _push_a_value_frame (caps, size, cv_option,
+                                    "1224", &error_src, &error, &received));
+  EXPECT_EQ (0U, received);
+
+  g_clear_error (&error);
+  g_free (error_src);
+}
+
+/**
+ * @brief Compare the elements at both ends of the tensor.
+ * @note Every element of the test frame is unique, so the buffer reaches the
+ * sink only if the element the option describes is the one that was read.
+ */
+TEST (tensorIfAppsrc, comparedValueBothEnds)
+{
+  gchar *error_src = NULL;
+  GError *error = NULL;
+  guint received = 0;
+
+  /* test_frames[0][0] */
+  EXPECT_EQ (GST_MESSAGE_EOS, _push_a_value_frame (TEST_FRAME_CAPS, TEST_FRAME_SIZE,
+                                  "0:0:0:0,0", "1101", &error_src, &error, &received));
+  EXPECT_EQ (1U, received);
+
+  /* test_frames[0][2 + 3 * 3 + 1 * 12 + 1 * 24], the last offset that fits */
+  EXPECT_EQ (GST_MESSAGE_EOS, _push_a_value_frame (TEST_FRAME_CAPS, TEST_FRAME_SIZE,
+                                  "2:3:1:1,0", "1224", &error_src, &error, &received));
+  EXPECT_EQ (1U, received);
+
+  g_clear_error (&error);
+  g_free (error_src);
+}
+
+/**
+ * @brief The element index of the first dimension is not in the tensor.
+ */
+TEST (tensorIfAppsrc, comparedValueIndexOverFirstDim_n)
+{
+  _expect_refused_cv_option (TEST_FRAME_CAPS, TEST_FRAME_SIZE, "3:0:0:0,0");
+}
+
+/**
+ * @brief The element index of the last dimension is one past the tensor.
+ */
+TEST (tensorIfAppsrc, comparedValueIndexOverLastDim_n)
+{
+  _expect_refused_cv_option (TEST_FRAME_CAPS, TEST_FRAME_SIZE, "0:0:0:2,0");
+}
+
+/**
+ * @brief The element index stays inside the tensor but not inside its dimension.
+ */
+TEST (tensorIfAppsrc, comparedValueIndexOverInnerDim_n)
+{
+  _expect_refused_cv_option (TEST_FRAME_CAPS, TEST_FRAME_SIZE, "0:4:0:0,0");
+}
+
+/**
+ * @brief The element index refers to a dimension the tensor does not have.
+ */
+TEST (tensorIfAppsrc, comparedValueIndexOverRank_n)
+{
+  _expect_refused_cv_option (TEST_FRAME_CAPS, TEST_FRAME_SIZE, "0:0:0:0:1,0");
+}
+
+/**
+ * @brief A negative element index wraps around the unsigned dimension index.
+ */
+TEST (tensorIfAppsrc, comparedValueNegativeIndex_n)
+{
+  _expect_refused_cv_option (TEST_FRAME_CAPS, TEST_FRAME_SIZE, "-1:0:0:0,0");
+}
+
+/**
+ * @brief An element index far past its dimension, which wrapped the 32-bit offset of main.
+ */
+TEST (tensorIfAppsrc, comparedValueHugeIndex_n)
+{
+  _expect_refused_cv_option (TEST_FRAME_CAPS, TEST_FRAME_SIZE, "2000000000:0:0:0,0");
+}
+
+/**
+ * @brief The caps declare more data than the buffer carries.
+ * @note The element is inside the dimensions, so only the size of the mapped
+ * memory can refuse it.
+ */
+TEST (tensorIfAppsrc, comparedValueBufferShorterThanCaps_n)
+{
+  _expect_refused_cv_option ("other/tensor,dimension=(string)4:2:1,type=(string)uint8,framerate=(fraction)0/1",
+      4, "0:1:0,0");
+}
+
+/**
+ * @brief The byte offset of the element is 2^64 - 1, one short of wrapping to 0.
+ * @note (2^32 - 1) * 2 + (2^32 - 1)^2 = 2^64 - 1, so a size check that adds the
+ * element size to the offset wraps and reads the byte before the buffer.
+ */
+TEST (tensorIfAppsrc, comparedValueOffsetWrapsAround_n)
+{
+  _expect_refused_overflow_caps ("other/tensor,dimension=(string)4294967295:4294967295:2,type=(string)uint8,framerate=(fraction)0/1",
+      4, "0:2:1,0");
+}
+
+#if GLIB_CHECK_VERSION(2, 48, 0)
+/**
+ * @brief The offset arithmetic overflows and wraps back into the buffer.
+ * @note 2^31 * 2^31 * 4 wraps to 0, so without the overflow check the last
+ * index adds nothing and the first byte of the buffer is compared silently.
+ */
+TEST (tensorIfAppsrc, comparedValueOffsetOverflow_n)
+{
+  _expect_refused_overflow_caps ("other/tensor,dimension=(string)2147483648:2147483648:4:2,type=(string)uint8,framerate=(fraction)0/1",
+      4, "0:0:0:1,0");
+}
+#endif
+
+/**
+ * @brief Custom callback that cannot tell the condition of the buffer.
+ */
+static gboolean
+tensor_if_custom_fail_cb (const GstTensorsInfo *info,
+    const GstTensorMemory *input, void *user_data, gboolean *result)
+{
+  return FALSE;
+}
+
+/**
+ * @brief The element reports the buffer a custom callback could not handle.
+ */
+TEST (tensorIfAppsrc, customCallbackFailure_n)
+{
+  gchar *error_src = NULL;
+  GError *error = NULL;
+  guint received = 0;
+  GstMessageType type;
+
+  ASSERT_EQ (0, nnstreamer_if_custom_register ("tif_fail", tensor_if_custom_fail_cb, NULL));
+
+  type = _push_if_frame (TEST_FRAME_CAPS, TEST_FRAME_SIZE,
+      "compared-value=CUSTOM compared-value-option=tif_fail then=PASSTHROUGH else=SKIP",
+      &error_src, &error, &received);
+  EXPECT_EQ (0, nnstreamer_if_custom_unregister ("tif_fail"));
+
+  EXPECT_EQ (GST_MESSAGE_ERROR, type);
+  EXPECT_STREQ ("tif", error_src);
+  ASSERT_NE (error, nullptr);
+  EXPECT_EQ (GST_STREAM_ERROR, error->domain);
+  EXPECT_EQ (GST_STREAM_ERROR_WRONG_TYPE, error->code);
+  EXPECT_EQ (0U, received);
+
+  g_clear_error (&error);
+  g_free (error_src);
+}
+
+/**
+ * @brief Number of tensors a stream carries to reach GstTensorsInfo::extra.
+ */
+#define EXTRA_NUM_TENSORS ((guint) (NNS_TENSOR_MEMORY_MAX + 4))
+
+/**
+ * @brief Start a standalone tensor_if and hand out its sink pad.
+ * @param tensor_if the element to start, filled in by this function
+ * @return the sink pad of the element, which the caller should unref
+ */
+static GstPad *
+_start_tensor_if (GstElement **tensor_if)
+{
+  GstElement *element;
+  GstPad *sinkpad;
+
+  element = gst_element_factory_make ("tensor_if", NULL);
+  if (element == NULL)
+    return NULL;
+
+  g_object_set (element, "compared-value", TIFCV_A_VALUE,
+      "compared-value-option", "0:0:0:0,0", "supplied-value", "0", "operator",
+      TIFOP_GE, "then", TIFB_PASSTHROUGH, "else", TIFB_SKIP, NULL);
+
+  gst_element_set_state (element, GST_STATE_PLAYING);
+  sinkpad = gst_element_get_static_pad (element, "sink");
+  gst_pad_send_event (sinkpad, gst_event_new_stream_start ("tensorif-extra"));
+
+  *tensor_if = element;
+  return sinkpad;
+}
+
+/**
+ * @brief Build a buffer of uint8 tensors, each holding 4 zeroed elements.
+ * @param info the tensors info describing the tensors of the buffer
+ * @return the buffer, which the caller should unref
+ */
+static GstBuffer *
+_buffer_with_tensors (GstTensorsInfo *info)
+{
+  GstBuffer *buffer = gst_buffer_new ();
+  guint i;
+
+  for (i = 0; i < info->num_tensors; i++) {
+    GstTensorInfo *_info = gst_tensors_info_get_nth_info (info, i);
+    GstMemory *mem = gst_allocator_alloc (NULL, gst_tensor_info_get_size (_info), NULL);
+    GstMapInfo map;
+
+    EXPECT_TRUE (gst_memory_map (mem, &map, GST_MAP_WRITE));
+    memset (map.data, 0, map.size);
+    gst_memory_unmap (mem, &map);
+
+    EXPECT_TRUE (gst_tensor_buffer_append_memory (buffer, mem, _info));
+  }
+
+  return buffer;
+}
+
+/**
+ * @brief Renegotiate a stream of more tensors than NNS_TENSOR_MEMORY_MAX, which
+ *        reparses the input configuration of tensor_if.
+ */
+TEST (tensorIfExtraTensors, capsRenegotiation)
+{
+  GstElement *tensor_if = NULL;
+  GstPad *sinkpad;
+  GstCaps *caps;
+
+  sinkpad = _start_tensor_if (&tensor_if);
+  ASSERT_NE (sinkpad, nullptr);
+
+  caps = caps_with_tensors (EXTRA_NUM_TENSORS, EXTRA_NUM_TENSORS);
+  EXPECT_TRUE (gst_pad_send_event (sinkpad, gst_event_new_caps (caps)));
+  gst_caps_unref (caps);
+
+  EXPECT_EQ (GST_TENSOR_IF (tensor_if)->in_config.info.num_tensors, EXTRA_NUM_TENSORS);
+  EXPECT_NE (GST_TENSOR_IF (tensor_if)->in_config.info.extra, nullptr);
+
+  caps = caps_with_tensors (EXTRA_NUM_TENSORS + 1, EXTRA_NUM_TENSORS + 1);
+  EXPECT_TRUE (gst_pad_send_event (sinkpad, gst_event_new_caps (caps)));
+  gst_caps_unref (caps);
+
+  EXPECT_EQ (GST_TENSOR_IF (tensor_if)->in_config.info.num_tensors, EXTRA_NUM_TENSORS + 1);
+
+  gst_element_set_state (tensor_if, GST_STATE_NULL);
+  gst_object_unref (sinkpad);
+  gst_object_unref (tensor_if);
+}
+
+/**
+ * @brief Negotiate a stream whose tensors are not all described.
+ */
+TEST (tensorIfExtraTensors, capsRenegotiation_n)
+{
+  GstElement *tensor_if = NULL;
+  GstPad *sinkpad;
+  GstCaps *caps;
+
+  sinkpad = _start_tensor_if (&tensor_if);
+  ASSERT_NE (sinkpad, nullptr);
+
+  caps = caps_with_tensors (EXTRA_NUM_TENSORS, EXTRA_NUM_TENSORS - 1);
+  EXPECT_FALSE (gst_pad_send_event (sinkpad, gst_event_new_caps (caps)));
+  gst_caps_unref (caps);
+
+  EXPECT_EQ (GST_TENSOR_IF (tensor_if)->in_config.info.num_tensors, 0U);
+
+  gst_element_set_state (tensor_if, GST_STATE_NULL);
+  gst_object_unref (sinkpad);
+  gst_object_unref (tensor_if);
+}
+
+/**
+ * @brief Pass a buffer of more tensors than NNS_TENSOR_MEMORY_MAX through,
+ * which fills the output configuration of tensor_if with extra tensors.
+ */
+TEST (tensorIfExtraTensors, passthroughBuffer)
+{
+  GstElement *tensor_if = NULL;
+  GstPad *sinkpad;
+  GstCaps *caps;
+  GstBuffer *buffer;
+  GstSegment segment;
+
+  sinkpad = _start_tensor_if (&tensor_if);
+  ASSERT_NE (sinkpad, nullptr);
+
+  caps = caps_with_tensors (EXTRA_NUM_TENSORS, EXTRA_NUM_TENSORS);
+  EXPECT_TRUE (gst_pad_send_event (sinkpad, gst_event_new_caps (caps)));
+  gst_caps_unref (caps);
+
+  gst_segment_init (&segment, GST_FORMAT_TIME);
+  EXPECT_TRUE (gst_pad_send_event (sinkpad, gst_event_new_segment (&segment)));
+
+  buffer = _buffer_with_tensors (&GST_TENSOR_IF (tensor_if)->in_config.info);
+  ASSERT_EQ (gst_tensor_buffer_get_count (buffer), EXTRA_NUM_TENSORS);
+
+  /* the then-pad is created by the chain and has no peer to push to */
+  EXPECT_EQ (gst_pad_chain (sinkpad, buffer), GST_FLOW_NOT_LINKED);
+  EXPECT_EQ (GST_TENSOR_IF (tensor_if)->out_config[0].info.num_tensors, EXTRA_NUM_TENSORS);
+  EXPECT_NE (GST_TENSOR_IF (tensor_if)->out_config[0].info.extra, nullptr);
+
+  gst_element_set_state (tensor_if, GST_STATE_NULL);
+  gst_object_unref (sinkpad);
+  gst_object_unref (tensor_if);
+}
+
+/**
+ * @brief Chain a buffer into a standalone tensor_if negotiated with the given
+ *        caps, and tell whether the element posted an error message.
+ * @param caps the caps to negotiate, or NULL to chain before any caps
+ * @param buffer the buffer to chain, which this function takes
+ * @param posted set to TRUE if the element posted an error message
+ * @return the flow return of the chain
+ */
+static GstFlowReturn
+_chain_tensor_if (GstCaps *caps, GstBuffer *buffer, gboolean *posted)
+{
+  GstElement *tensor_if = NULL;
+  GstPad *sinkpad;
+  GstBus *bus;
+  GstMessage *msg;
+  GstSegment segment;
+  GstFlowReturn ret;
+
+  sinkpad = _start_tensor_if (&tensor_if);
+  if (sinkpad == NULL) {
+    gst_buffer_unref (buffer);
+    return GST_FLOW_CUSTOM_ERROR;
+  }
+
+  bus = gst_bus_new ();
+  gst_element_set_bus (tensor_if, bus);
+
+  if (caps) {
+    EXPECT_TRUE (gst_pad_send_event (sinkpad, gst_event_new_caps (caps)));
+  }
+
+  gst_segment_init (&segment, GST_FORMAT_TIME);
+  EXPECT_TRUE (gst_pad_send_event (sinkpad, gst_event_new_segment (&segment)));
+
+  ret = gst_pad_chain (sinkpad, buffer);
+
+  msg = gst_bus_pop_filtered (bus, GST_MESSAGE_ERROR);
+  *posted = (msg != NULL);
+  if (msg)
+    gst_message_unref (msg);
+
+  gst_element_set_state (tensor_if, GST_STATE_NULL);
+  gst_element_set_bus (tensor_if, NULL);
+  gst_object_unref (bus);
+  gst_object_unref (sinkpad);
+  gst_object_unref (tensor_if);
+  return ret;
+}
+
+/**
+ * @brief Build a buffer of the given number of zeroed memories.
+ * @param num_mems the number of memories
+ * @param size the size of each memory
+ * @return the buffer, which the caller should unref
+ */
+static GstBuffer *
+_buffer_with_memories (guint num_mems, gsize size)
+{
+  GstBuffer *buffer = gst_buffer_new ();
+  guint i;
+
+  for (i = 0; i < num_mems; i++)
+    gst_buffer_append_memory (buffer, gst_allocator_alloc (NULL, size, NULL));
+
+  gst_buffer_memset (buffer, 0, 0, gst_buffer_get_size (buffer));
+  return buffer;
+}
+
+/**
+ * @brief Chain a buffer holding as many tensors as the caps declare.
+ */
+TEST (tensorIfTensorCount, matchingBuffer)
+{
+  GstCaps *caps = caps_with_tensors (2, 2);
+  gboolean posted = TRUE;
+
+  /* the then-pad is created by the chain and has no peer to push to */
+  EXPECT_EQ (_chain_tensor_if (caps, _buffer_with_memories (2, 4), &posted), GST_FLOW_NOT_LINKED);
+  EXPECT_FALSE (posted);
+
+  gst_caps_unref (caps);
+}
+
+/**
+ * @brief Chain a buffer holding more tensors than NNS_TENSOR_MEMORY_MAX, as
+ *        many as the caps declare.
+ */
+TEST (tensorIfTensorCount, matchingExtraBuffer)
+{
+  GstCaps *caps = caps_with_tensors (EXTRA_NUM_TENSORS, EXTRA_NUM_TENSORS);
+  GstTensorsConfig config;
+  GstBuffer *buffer;
+  gboolean posted = TRUE;
+
+  ASSERT_TRUE (gst_tensors_config_from_caps (&config, caps, TRUE));
+  buffer = _buffer_with_tensors (&config.info);
+  gst_tensors_config_free (&config);
+  ASSERT_EQ (gst_tensor_buffer_get_count (buffer), EXTRA_NUM_TENSORS);
+
+  EXPECT_EQ (_chain_tensor_if (caps, buffer, &posted), GST_FLOW_NOT_LINKED);
+  EXPECT_FALSE (posted);
+
+  gst_caps_unref (caps);
+}
+
+/**
+ * @brief Chain a buffer carrying the two tensors of the caps in one memory,
+ *        which used to abort the process.
+ */
+TEST (tensorIfTensorCount, fewerMemories_n)
+{
+  GstCaps *caps = caps_with_tensors (2, 2);
+  gboolean posted = FALSE;
+
+  EXPECT_EQ (_chain_tensor_if (caps, _buffer_with_memories (1, 8), &posted), GST_FLOW_ERROR);
+  EXPECT_TRUE (posted);
+
+  gst_caps_unref (caps);
+}
+
+/**
+ * @brief Chain a buffer of more memories than the caps declare tensors.
+ */
+TEST (tensorIfTensorCount, moreMemories_n)
+{
+  GstCaps *caps = caps_with_tensors (2, 2);
+  gboolean posted = FALSE;
+
+  EXPECT_EQ (_chain_tensor_if (caps, _buffer_with_memories (3, 4), &posted), GST_FLOW_ERROR);
+  EXPECT_TRUE (posted);
+
+  gst_caps_unref (caps);
+}
+
+/**
+ * @brief Chain a buffer before the caps are negotiated.
+ */
+TEST (tensorIfTensorCount, bufferBeforeCaps_n)
+{
+  gboolean posted = FALSE;
+
+  EXPECT_EQ (_chain_tensor_if (NULL, _buffer_with_memories (1, 4), &posted), GST_FLOW_ERROR);
+  EXPECT_TRUE (posted);
 }
 
 /**

@@ -35,6 +35,10 @@ static const gchar *gst_tensor_time_sync_mode_string[] = {
 /**
  * @brief Data structure to describe a "extra" tensor data.
  * This represents the information of the NNS_TENSOR_SIZE_LIMIT-th memory block for tensor stream.
+ * @note Each entry of @a infos sizes the memory of the extra tensor as it was
+ * copied into this block: a byte vector of the size of that memory, meta header
+ * included. What the tensor holds is described by the caps of the stream or by
+ * the meta header of the tensor itself, not by this entry.
  */
 typedef struct
 {
@@ -154,7 +158,7 @@ gst_tensor_time_sync_set_option_data (tensor_time_sync_data * sync)
       else
         sink_id = 0;
 
-      if (strv[1] != NULL)
+      if (strv[0] != NULL && strv[1] != NULL)
         duration = (guint) g_ascii_strtoull (strv[1], NULL, 10);
       else
         duration = G_MAXINT;
@@ -334,12 +338,14 @@ _gst_tensor_time_sync_buffer_update (GstCollectPads * collect,
 /**
  * @brief A function call to make tensors from collected pads.
  * It decide which buffer is going to be used according to sync option.
- * @return True to push buffer.
+ * @return GST_FLOW_OK to push buffer, GST_FLOW_EOS at end-of-stream,
+ *         GST_FLOW_CUSTOM_SUCCESS if there is nothing to push yet, and
+ *         GST_FLOW_ERROR if a collected buffer does not fit its pad.
  */
-gboolean
+GstFlowReturn
 gst_tensor_time_sync_buffer_from_collectpad (GstCollectPads * collect,
     tensor_time_sync_data * sync, GstClockTime current_time,
-    GstBuffer * tensors_buf, GstTensorsConfig * configs, gboolean * is_eos)
+    GstBuffer * tensors_buf, GstTensorsConfig * configs)
 {
   GSList *walk = NULL;
   GstCollectData *data;
@@ -355,12 +361,12 @@ gst_tensor_time_sync_buffer_from_collectpad (GstCollectPads * collect,
   guint i, j;
   GstMemory *in_mem[NNS_TENSOR_SIZE_LIMIT];
   tensor_format in_formats[NNS_TENSOR_SIZE_LIMIT];
+  GstFlowReturn ret = GST_FLOW_CUSTOM_SUCCESS;
 
-  g_return_val_if_fail (collect != NULL, FALSE);
-  g_return_val_if_fail (sync != NULL, FALSE);
-  g_return_val_if_fail (tensors_buf != NULL, FALSE);
-  g_return_val_if_fail (configs != NULL, FALSE);
-  g_return_val_if_fail (is_eos != NULL, FALSE);
+  g_return_val_if_fail (collect != NULL, GST_FLOW_ERROR);
+  g_return_val_if_fail (sync != NULL, GST_FLOW_ERROR);
+  g_return_val_if_fail (tensors_buf != NULL, GST_FLOW_ERROR);
+  g_return_val_if_fail (configs != NULL, GST_FLOW_ERROR);
 
   walk = collect->data;
   counting = empty_pad = 0;
@@ -369,7 +375,7 @@ gst_tensor_time_sync_buffer_from_collectpad (GstCollectPads * collect,
     walk = g_slist_nth (walk, sync->data_basepad.sink_id);
     if (walk == NULL) {
       GST_ERROR_OBJECT (collect, "Cannot get GstCollectData from GSList");
-      return FALSE;
+      return GST_FLOW_CUSTOM_SUCCESS;
     }
 
     data = (GstCollectData *) walk->data;
@@ -417,7 +423,7 @@ gst_tensor_time_sync_buffer_from_collectpad (GstCollectPads * collect,
      * this may cause unexpected exception.
      */
     if (!configured) {
-      return FALSE;
+      goto error;
     }
 
     if (in_configs.rate_d < old_denominator)
@@ -433,7 +439,7 @@ gst_tensor_time_sync_buffer_from_collectpad (GstCollectPads * collect,
       case SYNC_BASEPAD:
         if (!_gst_tensor_time_sync_buffer_update (collect, data,
                 current_time, base_time, sync))
-          return FALSE;
+          goto error;
         buf = gst_buffer_ref (pad->buffer);
         is_empty = (buf == NULL);
         break;
@@ -450,9 +456,8 @@ gst_tensor_time_sync_buffer_from_collectpad (GstCollectPads * collect,
           pad->buffer = gst_buffer_ref (buf);
         } else {
           if (pad->buffer == NULL) {
-            *is_eos = FALSE;
             ml_logd ("Not the all buffers are arrived yet.");
-            return FALSE;
+            goto error;
           }
           is_empty = TRUE;
           buf = gst_buffer_ref (pad->buffer);
@@ -463,14 +468,34 @@ gst_tensor_time_sync_buffer_from_collectpad (GstCollectPads * collect,
     }
 
     if (GST_IS_BUFFER (buf)) {
-      guint32 n_tensor = gst_tensor_buffer_get_count (buf);
-      buf = gst_tensor_buffer_from_config (buf, &in_configs);
+      gboolean is_static = gst_tensors_config_is_static (&in_configs);
+      guint32 n_tensor = 0;
 
-      /** These are internal logic error. If given inputs are incorrect,
-          the negotiation should have been failed before this stage. */
-      if (gst_tensors_config_is_static (&in_configs))
-        g_assert (n_tensor == in_configs.info.num_tensors);
-      g_assert ((counting + n_tensor) <= NNS_TENSOR_SIZE_LIMIT);
+      /* A flexible pad takes as many tensors as the incoming memories. */
+      if (!is_static)
+        n_tensor = gst_tensor_buffer_get_count (buf);
+
+      buf = gst_tensor_buffer_from_config (buf, &in_configs);
+      if (buf == NULL) {
+        nns_loge ("The buffer of %s:%s does not fit its tensors config.",
+            GST_DEBUG_PAD_NAME (data->pad));
+        ret = GST_FLOW_ERROR;
+        goto error;
+      }
+
+      if (is_static)
+        n_tensor = gst_tensor_buffer_get_count (buf);
+
+      if ((is_static && n_tensor != in_configs.info.num_tensors) ||
+          n_tensor > NNS_TENSOR_SIZE_LIMIT - counting) {
+        nns_loge ("The buffer of %s:%s has %u tensors, cannot collect it "
+            "(%u tensors collected, the limit is %d).",
+            GST_DEBUG_PAD_NAME (data->pad), n_tensor, counting,
+            NNS_TENSOR_SIZE_LIMIT);
+        gst_buffer_unref (buf);
+        ret = GST_FLOW_ERROR;
+        goto error;
+      }
 
       if (gst_tensors_config_is_flexible (&in_configs))
         configs->info.format = _NNS_TENSOR_FORMAT_FLEXIBLE;
@@ -512,7 +537,8 @@ gst_tensor_time_sync_buffer_from_collectpad (GstCollectPads * collect,
         gst_memory_unref (in_mem[j]);
 
       nns_loge ("Failed to append memory to buffer.");
-      return FALSE;
+      gst_tensors_config_free (&in_configs);
+      return GST_FLOW_CUSTOM_SUCCESS;
     }
   }
 
@@ -525,8 +551,16 @@ gst_tensor_time_sync_buffer_from_collectpad (GstCollectPads * collect,
   gst_tensors_config_free (&in_configs);
 
   /* check eos */
-  *is_eos = _gst_tensor_time_sync_is_eos (collect, sync, empty_pad);
-  return !(*is_eos);
+  if (_gst_tensor_time_sync_is_eos (collect, sync, empty_pad))
+    return GST_FLOW_EOS;
+  return GST_FLOW_OK;
+
+error:
+  for (i = 0; i < counting; i++)
+    gst_memory_unref (in_mem[i]);
+
+  gst_tensors_config_free (&in_configs);
+  return ret;
 }
 
 /**
@@ -974,7 +1008,8 @@ _get_tensors_caps (const GstTensorsConfig * config)
     prev2 = gst_caps_from_string (GST_TENSORS_CAP_DEFAULT);
   }
 
-  if (config->info.num_tensors > 0) {
+  if (config->info.num_tensors > 0 &&
+      config->info.num_tensors <= NNS_TENSOR_SIZE_LIMIT) {
     g_autofree gchar *type_str =
         gst_tensors_info_get_types_string (&config->info);
     g_autofree gchar *dim_str =
@@ -1484,6 +1519,9 @@ gst_tensor_caps_from_config (const GstTensorsConfig * config)
  * @param config tensors config structure to be filled
  * @param structure structure to be interpreted
  * @return TRUE if no error
+ * @note A static structure declaring a number of tensors outside 1 to
+ * NNS_TENSOR_SIZE_LIMIT is rejected, and the config is left initialized so
+ * that a caller ignoring the return value cannot index the info out of bounds.
  */
 gboolean
 gst_tensors_config_from_structure (GstTensorsConfig * config,
@@ -1534,8 +1572,17 @@ gst_tensors_config_from_structure (GstTensorsConfig * config,
     config->info.format = format;
 
     if (config->info.format == _NNS_TENSOR_FORMAT_STATIC) {
-      gst_structure_get_int (structure, "num_tensors",
-          (gint *) (&config->info.num_tensors));
+      gint num_tensors = 0;
+
+      if (gst_structure_get_int (structure, "num_tensors", &num_tensors)) {
+        if (num_tensors < 1 || num_tensors > NNS_TENSOR_SIZE_LIMIT) {
+          nns_logw ("Invalid num_tensors %d, it should be between 1 and %d.\n",
+              num_tensors, NNS_TENSOR_SIZE_LIMIT);
+          return FALSE;
+        }
+
+        config->info.num_tensors = (guint) num_tensors;
+      }
 
       /* parse dimensions */
       if (gst_structure_has_field (structure, "dimensions")) {
@@ -1791,11 +1838,11 @@ gst_tensor_buffer_append_memory (GstBuffer * buffer, GstMemory * memory,
 {
   guint num_mems, new_mem_index;
   GstMemory *new_memory = NULL, *last_memory = NULL;
-  gsize offset, new_mem_size, last_mem_size;
+  gsize offset, new_mem_size, last_mem_size, incoming_mem_size;
   GstMapInfo new_memory_map, last_memory_map, incoming_memory_map;
   GstTensorExtraInfo *extra_info;
   GstTensorMetaInfo meta;
-  gboolean is_extra, is_static;
+  gboolean is_extra;
   gboolean appended = FALSE;
 
   if (!GST_IS_BUFFER (buffer)) {
@@ -1808,13 +1855,8 @@ gst_tensor_buffer_append_memory (GstBuffer * buffer, GstMemory * memory,
     goto failed;
   }
 
-  if (gst_tensor_meta_info_parse_memory (&meta, memory)) {
-    is_static = (meta.format == _NNS_TENSOR_FORMAT_STATIC);
-  } else {
-    /* Suppose given memory is static tensor. */
-    is_static = TRUE;
-
-    /* Error case if given tensor-info is invalid. */
+  if (!gst_tensor_meta_info_parse_memory (&meta, memory)) {
+    /* Suppose given memory is static tensor, described by the given info. */
     if (!gst_tensor_info_validate (info)) {
       nns_loge ("Failed to get tensor info (invalid input info).");
       goto failed;
@@ -1830,6 +1872,14 @@ gst_tensor_buffer_append_memory (GstBuffer * buffer, GstMemory * memory,
   }
 
   /* given buffer has NNS_TENSOR_MEMORY_MAX memory blocks */
+  incoming_mem_size = gst_memory_get_sizes (memory, NULL, NULL);
+  if (incoming_mem_size > G_MAXUINT32) {
+    nns_loge ("Failed to append memory, the given memory (%" G_GSIZE_FORMAT
+        " bytes) is too large to describe in the extra header.",
+        incoming_mem_size);
+    goto failed;
+  }
+
   last_memory = gst_buffer_peek_memory (buffer, num_mems - 1);
   if (!last_memory) {
     nns_loge ("Failed to get last memory");
@@ -1858,7 +1908,7 @@ gst_tensor_buffer_append_memory (GstBuffer * buffer, GstMemory * memory,
     new_mem_size += sizeof (GstTensorExtraInfo);
   }
 
-  new_mem_size += gst_memory_get_sizes (memory, NULL, NULL);
+  new_mem_size += incoming_mem_size;
 
   new_memory = gst_allocator_alloc (NULL, new_mem_size, NULL);
   if (!new_memory) {
@@ -1896,18 +1946,10 @@ gst_tensor_buffer_append_memory (GstBuffer * buffer, GstMemory * memory,
   new_mem_index = extra_info->num_extra_tensors;
   extra_info->num_extra_tensors += 1;
 
-  /* Copy tensor info into extra. */
-  if (is_static) {
-    gst_tensor_info_copy (&extra_info->infos[new_mem_index], info);
-
-    /**
-     * Free the name string, cause it does not freed by gstreamer.
-     * @todo Make custom gst_allocator later?
-     */
-    g_clear_pointer (&extra_info->infos[new_mem_index].name, g_free);
-  } else {
-    gst_tensor_meta_info_convert (&meta, &extra_info->infos[new_mem_index]);
-  }
+  /* Describe the bytes of the memory as they are copied into extra. */
+  gst_tensor_info_init (&extra_info->infos[new_mem_index]);
+  extra_info->infos[new_mem_index].type = _NNS_UINT8;
+  extra_info->infos[new_mem_index].dimension[0] = (uint32_t) incoming_mem_size;
 
   memcpy (new_memory_map.data + offset + last_memory_map.size,
       incoming_memory_map.data, incoming_memory_map.size);

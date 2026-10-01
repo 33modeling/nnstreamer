@@ -42,7 +42,7 @@ gst_tensor_info_free (GstTensorInfo * info);
 /**
  * @brief Get data size of single tensor
  * @param info tensor info structure
- * @return data size
+ * @return data size (0 if the size overflows)
  */
 extern gsize
 gst_tensor_info_get_size (const GstTensorInfo *info);
@@ -129,7 +129,7 @@ gst_tensors_info_free (GstTensorsInfo * info);
  * @brief Get data size of single tensor
  * @param info tensors info structure
  * @param index the index of tensor (-1 to get total size of tensors)
- * @return data size
+ * @return data size (0 if the size overflows)
  */
 gsize
 gst_tensors_info_get_size (const GstTensorsInfo * info, gint index);
@@ -167,7 +167,7 @@ gst_tensors_info_parse_names_string (GstTensorsInfo * info,
 /**
  * @brief Get the string of dimensions in tensors info
  * @param info tensors info structure
- * @return string of dimensions in tensors info (NULL if the number of tensors is 0)
+ * @return string of dimensions in tensors info (NULL if the number of tensors is 0 or out of bound)
  * @note The returned value should be freed with g_free()
  */
 extern gchar *
@@ -178,7 +178,7 @@ gst_tensors_info_get_dimensions_string (const GstTensorsInfo * info);
  * @param info tensors info structure
  * @param rank rank count of given tensor dimension
  * @param padding fill 1 if actual rank is smaller than rank
- * @return Formatted string of given dimension
+ * @return Formatted string of given dimension (NULL if the number of tensors is 0 or out of bound)
  * @note If rank count is 3, then returned string is 'd1:d2:d3`.
  * The returned value should be freed with g_free()
  */
@@ -189,7 +189,7 @@ gst_tensors_info_get_rank_dimensions_string (const GstTensorsInfo * info,
 /**
  * @brief Get the string of types in tensors info
  * @param info tensors info structure
- * @return string of types in tensors info (NULL if the number of tensors is 0)
+ * @return string of types in tensors info (NULL if the number of tensors is 0 or out of bound)
  * @note The returned value should be freed with g_free()
  */
 extern gchar *
@@ -198,7 +198,7 @@ gst_tensors_info_get_types_string (const GstTensorsInfo * info);
 /**
  * @brief Get the string of tensor names in tensors info
  * @param info tensors info structure
- * @return string of names in tensors info (NULL if the number of tensors is 0)
+ * @return string of names in tensors info (NULL if the number of tensors is 0 or out of bound)
  * @note The returned value should be freed with g_free()
  */
 extern gchar *
@@ -374,7 +374,7 @@ gst_tensor_dimension_string_is_equal (const gchar * dimstr1, const gchar * dimst
 
 /**
  * @brief Count the number of elements of a tensor
- * @return The number of elements. 0 if error.
+ * @return The number of elements. 0 if error or if the count overflows.
  * @param dim The tensor dimension
  */
 extern gulong
@@ -459,7 +459,7 @@ gst_tensor_meta_info_get_header_size (GstTensorMetaInfo * meta);
 /**
  * @brief Get the data size calculated from tensor meta.
  * @param[in] meta tensor meta structure
- * @return The data size for meta info (0 if meta is invalid)
+ * @return The data size for meta info (0 if meta is invalid or the size overflows)
  */
 extern gsize
 gst_tensor_meta_info_get_data_size (GstTensorMetaInfo * meta);
@@ -487,6 +487,9 @@ gst_tensor_meta_info_parse_header (GstTensorMetaInfo * meta, gpointer header);
  * @brief Convert GstTensorMetaInfo structure to GstTensorInfo.
  * @param[in] meta tensor meta structure to be converted
  * @param[out] info GstTensorInfo to be filled
+ * @note A meta header carries no tensor name, so this initializes @a info and
+ *       leaves its name unset. Pass an uninitialized or empty info: a name the
+ *       caller has allocated in @a info is dropped without being freed.
  * @return TRUE if successfully set the info
  */
 gboolean

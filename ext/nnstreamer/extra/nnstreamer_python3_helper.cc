@@ -317,6 +317,11 @@ loadScript (PyObject **core_obj, const gchar *module_name, const gchar *class_na
     if (cls) {
       *core_obj = PyObject_CallObject (cls, NULL);
       Py_SAFEDECREF (cls);
+
+      if (*core_obj == NULL) {
+        Py_ERRMSG ("Cannot create an instance of '%s' in the script.\n", class_name);
+        return -3;
+      }
     } else {
       Py_ERRMSG ("Cannot find '%s' class in the script.\n", class_name);
       return -2;
@@ -379,8 +384,15 @@ addToSysPath (const gchar *path)
     return -1;
   }
 
-  PyList_Append (sys_path, PyUnicode_FromString ("."));
-  PyList_Append (sys_path, PyUnicode_FromString (path));
+  const gchar *entries[] = { ".", path };
+  for (const gchar *entry : entries) {
+    PyObject *item = PyUnicode_FromString (entry);
+
+    if (item && PySequence_Contains (sys_path, item) == 0)
+      PyList_Append (sys_path, item);
+    Py_SAFEDECREF (item);
+    PyErr_Clear ();
+  }
 
   Py_SAFEDECREF (sys_path);
   Py_SAFEDECREF (sys_module);
@@ -529,7 +541,10 @@ PyTensorShape_New (PyObject *shape_cls, const GstTensorInfo *info)
   PyTuple_SetItem (args, 0, dims);
   PyTuple_SetItem (args, 1, type);
 
-  return PyObject_CallObject (shape_cls, args);
+  PyObject *shape = PyObject_CallObject (shape_cls, args);
+  Py_SAFEDECREF (args);
+
+  return shape;
   /* Its value is checked by setInputTensorDim */
 }
 

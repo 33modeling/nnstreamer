@@ -43,7 +43,8 @@ gst_tensor_decoder_protobuf (const GstTensorsConfig *config,
   guint num_tensors;
   gboolean is_flexible;
   GstTensorMetaInfo meta;
-  GstTensorInfo *_info;
+  GstTensorInfo flex_info;
+  const GstTensorInfo *_info, *_shape;
 
   if (!config || !input || !outbuf) {
     ml_loge ("NULL parameter is passed to tensor_decoder::protobuf");
@@ -76,18 +77,28 @@ gst_tensor_decoder_protobuf (const GstTensorsConfig *config,
   for (unsigned int i = 0; i < num_tensors; ++i) {
     nnstreamer::protobuf::Tensor *tensor = tensors.add_tensor ();
 
-    _info = gst_tensors_info_get_nth_info ((GstTensorsInfo *) &config->info, i);
+    _shape = _info = gst_tensors_info_get_nth_info ((GstTensorsInfo *) &config->info, i);
 
     if (is_flexible) {
-      gst_tensor_meta_info_parse_header (&meta, input[i].data);
-      gst_tensor_meta_info_convert (&meta, _info);
+      gst_tensor_meta_info_init (&meta);
+
+      /* parse_header () reads a whole header of the default version before validating it */
+      if (input[i].size < gst_tensor_meta_info_get_header_size (&meta)
+          || !gst_tensor_meta_info_parse_header (&meta, input[i].data)
+          || !gst_tensor_meta_info_convert (&meta, &flex_info)) {
+        ml_loge ("Failed to parse the meta header of the %u'th tensor in tensor_decoder::protobuf.",
+            i);
+        return GST_FLOW_ERROR;
+      }
+
+      _shape = &flex_info;
     }
 
     tensor->set_name (_info->name ? _info->name : "");
-    tensor->set_type ((nnstreamer::protobuf::Tensor::Tensor_type) _info->type);
+    tensor->set_type ((nnstreamer::protobuf::Tensor::Tensor_type) _shape->type);
 
     for (int j = 0; j < NNS_TENSOR_RANK_LIMIT; ++j) {
-      tensor->add_dimension (_info->dimension[j]);
+      tensor->add_dimension (_shape->dimension[j]);
     }
 
     tensor->set_data (input[i].data, (int) input[i].size);
@@ -123,6 +134,57 @@ gst_tensor_decoder_protobuf (const GstTensorsConfig *config,
   return GST_FLOW_OK;
 }
 
+/**
+ * @brief Check that the data a protobuf message carries for a tensor holds what the message declares for it.
+ * @note The same check as tcu_check_tensor_data () of the converter util, which this library is not linked with.
+ */
+static gboolean
+_check_tensor_data (const GstTensorsConfig *config, const GstTensorInfo *info,
+    const guint8 *data, gsize size)
+{
+  GstTensorMetaInfo meta;
+  gsize hsize, expected;
+
+  if (config->info.format >= _NNS_TENSOR_FORMAT_END) {
+    nns_loge ("The protobuf message declares an unknown tensor format %d.",
+        config->info.format);
+    return FALSE;
+  }
+
+  if (gst_tensors_config_is_static (config)) {
+    if ((guint) info->type >= _NNS_END || !gst_tensor_info_validate (info)) {
+      nns_loge ("The protobuf message declares an invalid type or dimension of a tensor.");
+      return FALSE;
+    }
+
+    expected = gst_tensor_info_get_size (info);
+    if (size != expected) {
+      nns_loge ("The protobuf message carries %zu bytes for a tensor declared as %zu bytes.",
+          size, expected);
+      return FALSE;
+    }
+
+    return TRUE;
+  }
+
+  gst_tensor_meta_info_init (&meta);
+  if (size < gst_tensor_meta_info_get_header_size (&meta)
+      || !gst_tensor_meta_info_parse_header (&meta, (gpointer) data)) {
+    nns_loge ("The protobuf message carries a tensor without a valid meta header.");
+    return FALSE;
+  }
+
+  hsize = gst_tensor_meta_info_get_header_size (&meta);
+  expected = hsize + gst_tensor_meta_info_get_data_size (&meta);
+  if (hsize == 0 || size < expected) {
+    nns_loge ("The protobuf message carries %zu bytes for a tensor whose meta header declares %zu bytes.",
+        size, expected);
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
 /** @brief tensor converter plugin's NNStreamerExternalConverter callback */
 GstBuffer *
 gst_tensor_converter_protobuf (GstBuffer *in_buf, GstTensorsConfig *config, void *priv_data)
@@ -132,7 +194,7 @@ gst_tensor_converter_protobuf (GstBuffer *in_buf, GstTensorsConfig *config, void
   GstTensorInfo *_info;
   GstMemory *in_mem, *out_mem;
   GstMapInfo in_info;
-  GstBuffer *out_buf;
+  GstBuffer *out_buf = NULL;
   gsize mem_size;
   gpointer mem_data;
   UNUSED (priv_data);
@@ -149,10 +211,21 @@ gst_tensor_converter_protobuf (GstBuffer *in_buf, GstTensorsConfig *config, void
     return NULL;
   }
 
-  tensors.ParseFromArray (in_info.data, in_info.size);
+  if (!tensors.ParseFromArray (in_info.data, in_info.size)) {
+    nns_loge ("The incoming buffer is not a valid protobuf message of tensors / tensor_converter_protobuf");
+    goto done;
+  }
 
   config->info.num_tensors = tensors.num_tensor ();
   config->info.format = (tensor_format) tensors.format ();
+
+  if (config->info.num_tensors == 0 || config->info.num_tensors > NNS_TENSOR_SIZE_LIMIT
+      || config->info.num_tensors > (guint) tensors.tensor_size ()) {
+    nns_loge ("The protobuf message declares %u tensors, carries %d, and between 1 and %d are allowed / tensor_converter_protobuf",
+        config->info.num_tensors, tensors.tensor_size (), NNS_TENSOR_SIZE_LIMIT);
+    goto done;
+  }
+
   fr = tensors.mutable_fr ();
   config->rate_n = fr->rate_n ();
   config->rate_d = fr->rate_d ();
@@ -165,10 +238,21 @@ gst_tensor_converter_protobuf (GstBuffer *in_buf, GstTensorsConfig *config, void
 
     _info = gst_tensors_info_get_nth_info (&config->info, i);
 
+    g_free (_info->name);
     _info->name = (name && strlen (name) > 0) ? g_strdup (name) : NULL;
     _info->type = (tensor_type) tensor->type ();
     for (guint j = 0; j < NNS_TENSOR_RANK_LIMIT; j++) {
-      _info->dimension[j] = tensor->dimension (j);
+      _info->dimension[j]
+          = ((int) j < tensor->dimension_size ()) ? tensor->dimension (j) : 0;
+    }
+
+    if (!_check_tensor_data (config, _info,
+            (const guint8 *) tensor->data ().data (), tensor->data ().length ())) {
+      nns_loge ("Cannot convert the %u'th tensor of the protobuf message / tensor_converter_protobuf",
+          i);
+      gst_buffer_unref (out_buf);
+      out_buf = NULL;
+      goto done;
     }
     mem_size = tensor->data ().length ();
     mem_data = _g_memdup (tensor->data ().c_str (), mem_size);
@@ -182,6 +266,7 @@ gst_tensor_converter_protobuf (GstBuffer *in_buf, GstTensorsConfig *config, void
   /** copy timestamps */
   gst_buffer_copy_into (
       out_buf, in_buf, (GstBufferCopyFlags) GST_BUFFER_COPY_METADATA, 0, -1);
+done:
   gst_memory_unmap (in_mem, &in_info);
   gst_memory_unref (in_mem);
 

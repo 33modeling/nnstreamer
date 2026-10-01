@@ -530,13 +530,15 @@ gst_tensor_aggregator_get_adapter (GstTensorAggregator * self, GstBuffer * buf)
 
 /**
  * @brief Check tensor dimension and axis to concatenate data.
- * @param self this pointer to GstTensorAggregator
  * @param info tensor info for one frame
+ * @param concat the concat property value for this buffer
+ * @param frames_out the frames-out property value for this buffer
+ * @param frames_dim the frames-dim property value for this buffer
  * @return True if needed to concatenate
  */
 static gboolean
-gst_tensor_aggregator_check_concat_axis (GstTensorAggregator * self,
-    const GstTensorInfo * info)
+gst_tensor_aggregator_check_concat_axis (const GstTensorInfo * info,
+    gboolean concat, guint frames_out, guint frames_dim)
 {
   guint i;
 
@@ -545,8 +547,8 @@ gst_tensor_aggregator_check_concat_axis (GstTensorAggregator * self,
   /**
    * Check condition to concatenate data.
    */
-  if (self->concat && self->frames_out > 1) {
-    for (i = self->frames_dim + 1; i < NNS_TENSOR_RANK_LIMIT; i++) {
+  if (concat && frames_out > 1) {
+    for (i = frames_dim + 1; i < NNS_TENSOR_RANK_LIMIT; i++) {
       if (info->dimension[i] > 1) {
         /** concatenate data */
         return TRUE;
@@ -559,13 +561,15 @@ gst_tensor_aggregator_check_concat_axis (GstTensorAggregator * self,
 
 /**
  * @brief Change the data in buffer with given axis.
- * @param self this pointer to GstTensorAggregator
- * @param outbuf buffer to be concatenated
+ * @param outbuf buffer to be concatenated (transfer full)
  * @param info tensor info for one frame
+ * @param frames_out the frames-out property value for this buffer
+ * @param frames_dim the frames-dim property value for this buffer
+ * @return the concatenated buffer (transfer full), or NULL on failure (outbuf is released)
  */
-static gboolean
-gst_tensor_aggregator_concat (GstTensorAggregator * self, GstBuffer * outbuf,
-    const GstTensorInfo * info)
+static GstBuffer *
+gst_tensor_aggregator_concat (GstBuffer * outbuf, const GstTensorInfo * info,
+    guint frames_out, guint frames_dim)
 {
   GstBuffer *srcbuf;
   GstMapInfo src_info, dest_info;
@@ -583,13 +587,15 @@ gst_tensor_aggregator_concat (GstTensorAggregator * self, GstBuffer * outbuf,
   if (!gst_buffer_map (srcbuf, &src_info, GST_MAP_READ)) {
     ml_logf ("Failed to map source buffer with tensor_aggregator.\n");
     gst_buffer_unref (srcbuf);
-    return FALSE;
+    gst_buffer_unref (outbuf);
+    return NULL;
   }
   if (!gst_buffer_map (outbuf, &dest_info, GST_MAP_WRITE)) {
     ml_logf ("Failed to map destination buffer with tensor_aggregator.\n");
     gst_buffer_unmap (srcbuf, &src_info);
     gst_buffer_unref (srcbuf);
-    return FALSE;
+    gst_buffer_unref (outbuf);
+    return NULL;
   }
 
   /**
@@ -769,14 +775,14 @@ gst_tensor_aggregator_concat (GstTensorAggregator * self, GstBuffer * outbuf,
 
   /** get block size */
   block_size = gst_tensor_get_element_size (info->type);
-  for (f = 0; f <= self->frames_dim; f++) {
+  for (f = 0; f <= frames_dim; f++) {
     block_size *= info->dimension[f];
   }
 
   src_idx = dest_idx = 0;
 
   do {
-    for (f = 0; f < self->frames_out; f++) {
+    for (f = 0; f < frames_out; f++) {
       nns_memcpy (dest_info.data + dest_idx,
           src_info.data + src_idx + (frame_size * f), block_size);
       dest_idx += block_size;
@@ -793,34 +799,45 @@ gst_tensor_aggregator_concat (GstTensorAggregator * self, GstBuffer * outbuf,
 
   gst_buffer_unref (srcbuf);
 
-  return TRUE;
+  return outbuf;
 }
 
 /**
  * @brief Push the buffer to source pad. (Concatenate the buffer if needed)
+ * @param self this pointer to GstTensorAggregator
+ * @param outbuf buffer to be pushed (transfer full)
+ * @param frame_size size of one frame in bytes
+ * @param frames_out the frames-out property value for this buffer
+ * @param frames_dim the frames-dim property value for this buffer
+ * @param concat the concat property value for this buffer
+ * @return the flow return of the push, or GST_FLOW_ERROR on failure (outbuf is released)
  */
 static GstFlowReturn
 gst_tensor_aggregator_push (GstTensorAggregator * self, GstBuffer * outbuf,
-    gsize frame_size)
+    gsize frame_size, guint frames_out, guint frames_dim, gboolean concat)
 {
   GstTensorInfo info;
 
   /** tensor info for one frame */
   info = *gst_tensors_info_get_nth_info (&self->out_config.info, 0);
 
-  g_assert (self->frames_dim < NNS_TENSOR_RANK_LIMIT);
-  info.dimension[self->frames_dim] /= self->frames_out;
+  g_assert (frames_dim < NNS_TENSOR_RANK_LIMIT);
+  info.dimension[frames_dim] /= frames_out;
 
   if (frame_size != gst_tensor_info_get_size (&info) || frame_size == 0U) {
     ml_logf
         ("Invalid output capability of tensor_aggregator. Frame size = %"
         G_GSIZE_FORMAT "\n", frame_size);
+    gst_buffer_unref (outbuf);
     return GST_FLOW_ERROR;
   }
 
-  if (gst_tensor_aggregator_check_concat_axis (self, &info)) {
+  if (gst_tensor_aggregator_check_concat_axis (&info, concat, frames_out,
+          frames_dim)) {
     /** change data in buffer with given axis */
-    if (!gst_tensor_aggregator_concat (self, outbuf, &info))
+    outbuf = gst_tensor_aggregator_concat (outbuf, &info, frames_out,
+        frames_dim);
+    if (!outbuf)
       return GST_FLOW_ERROR;
   }
 
@@ -836,8 +853,9 @@ gst_tensor_aggregator_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
   GstTensorAggregator *self;
   GstFlowReturn ret = GST_FLOW_OK;
   GstAdapter *adapter;
-  gsize avail, buf_size, frame_size, out_size;
-  guint frames_in, frames_out, frames_flush;
+  gsize avail, buf_size, in_size, frame_size, out_size;
+  guint frames_in, frames_out, frames_flush, frames_dim;
+  gboolean concat;
   GstClockTime duration;
   UNUSED (pad);
 
@@ -845,16 +863,25 @@ gst_tensor_aggregator_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
   g_assert (self->tensor_configured);
 
   buf_size = gst_buffer_get_size (buf);
-  g_return_val_if_fail (buf_size > 0, GST_FLOW_ERROR);
+  in_size = gst_tensors_info_get_size (&self->in_config.info, 0);
+  if (buf_size != in_size) {
+    GST_ERROR_OBJECT (self, "Invalid input buffer size %" G_GSIZE_FORMAT
+        ", expected %" G_GSIZE_FORMAT, buf_size, in_size);
+    gst_buffer_unref (buf);
+    return GST_FLOW_ERROR;
+  }
 
   frames_in = self->frames_in;
   frames_out = self->frames_out;
   frames_flush = self->frames_flush;
+  frames_dim = self->frames_dim;
+  concat = self->concat;
   frame_size = buf_size / frames_in;
 
   if (frames_in == frames_out) {
     /** push the incoming buffer (do concat if needed) */
-    return gst_tensor_aggregator_push (self, buf, frame_size);
+    return gst_tensor_aggregator_push (self, buf, frame_size, frames_out,
+        frames_dim, concat);
   }
 
   adapter = gst_tensor_aggregator_get_adapter (self, buf);
@@ -869,7 +896,6 @@ gst_tensor_aggregator_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
   gst_adapter_push (adapter, buf);
 
   out_size = frame_size * frames_out;
-  g_assert (out_size > 0);
 
   while ((avail = gst_adapter_available (adapter)) >= out_size &&
       ret == GST_FLOW_OK) {
@@ -914,7 +940,8 @@ gst_tensor_aggregator_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
     GST_BUFFER_DTS (outbuf) = dts;
     GST_BUFFER_DURATION (outbuf) = duration;
 
-    ret = gst_tensor_aggregator_push (self, outbuf, frame_size);
+    ret = gst_tensor_aggregator_push (self, outbuf, frame_size, frames_out,
+        frames_dim, concat);
 
     /** flush data */
     if (frames_flush > 0) {

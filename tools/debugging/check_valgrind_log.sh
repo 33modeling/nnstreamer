@@ -6,7 +6,7 @@
 # SPDX-License-Identifier: LGPL-2.1-only
 #
 # @file     check_valgrind_log.sh
-# @brief    Fail when a memcheck error comes from this repository's own code.
+# @brief    Fail when a memcheck error or leak comes from this repository's own code.
 # @see      https://github.com/nnstreamer/nnstreamer
 # @author   MyungJoo Ham <myungjoo.ham@samsung.com>
 #
@@ -14,7 +14,8 @@
 #
 # Reads the text memcheck writes and reports each error twice over: once by
 # what kind of error it is, and once by whose code the reported frame is in.
-# Only a non-leak error whose reported frame is ours makes this exit non-zero.
+# A non-leak error whose reported frame is ours makes this exit non-zero, and
+# so does a definite leak of ours.
 #
 # An error is attributed to the frame memcheck blames for it - the first one
 # that is not valgrind's own allocation wrapper - and that frame is ours when
@@ -41,18 +42,51 @@
 # the path, which is what lets a log recorded on another machine be checked
 # here, and which stops recognising objects if the build directory is ever
 # renamed; the file-name half still covers everything built with debug info.
+# Not everything under the build directory is built from this tree, though:
+# the CI job copies the prebuilt ggml backends of llama.cpp (libggml*) into
+# build/tests, where they must be found next to the test binaries, so those
+# objects are excluded by name.
 #
 # A report whose first line matches none of the kinds below is neither passed
 # nor failed on, so it is printed as a warning instead of disappearing.
 #
-# Leaks are counted and printed but never gate, because a leak is reported at
-# its allocation, which for most of ours is inside GLib; deciding who was
-# responsible for freeing it needs a rule this script does not have.
+# A definite leak is attributed differently. Memcheck reports it where its
+# block was allocated, which for most of ours is inside GLib, so it is ours
+# when any frame of that stack is, and it is decided by the innermost such
+# frame; for a leak a test drives, that is the test's own frame, nearer the
+# allocation than the gtest code linked into the same binary. A stack cut
+# short before any frame of ours is not ours, so memcheck has to be asked for
+# enough callers; packaging/run_unittests_binaries.sh asks for 200. The rule
+# cannot see a block allocated wholly by library code that our code then drops,
+# such as a buffer from an upstream element on a streaming thread: no frame of
+# ours is on that stack, so such a leak passes as a library one.
+#
+# Two callers are exempt even so: a block allocated while the dynamic loader
+# loads a library or runs its initialisers belongs to the loader or to that
+# library, and GStreamer leaks the list of log functions it replaces on
+# purpose. A stack that passes through either before reaching a frame of ours
+# is not ours. Possible and indirect leaks are only counted, the former being
+# mostly the thread-local storage of threads still running at exit and the
+# latter reachable only through a definite one.
 #
 # --require-output additionally fails when the log holds no memcheck output at
 # all. A caller that always runs memcheck wants that, because a log that lost
 # it - a runner that died early, a flag that stopped matching - would otherwise
 # be indistinguishable here from a clean one.
+#
+# With the same option, a binary whose memcheck run never reached its ERROR
+# SUMMARY fails too, since nothing it did was checked. Valgrind prints the
+# Command line of its banner before it can abort at startup - a missing
+# redirection when glibc debug info is not installed is the usual reason, a
+# suppression file it cannot open another - and a killed run or a cut log
+# stops short of the summary the same way. Runs are matched by process id, so
+# the summary a forked child prints under its own id settles nothing, and each
+# new run forgets the ids before it, so a later process that reuses the id of
+# a run that stopped short cannot settle that run. That relies on runs following
+# one another, as packaging/run_unittests_binaries.sh starts them, without
+# --trace-children: a traced child that execs would print a Command line of
+# its own while its parent still runs, and the parent would then fail as
+# unfinished.
 #
 
 set -u
@@ -140,11 +174,30 @@ function is_valgrind_own(where) {
 
 function is_ours(where,   file) {
   if (where ~ /^in /) {
+    if (where ~ /\/libggml[^\/]*$/)
+      return 0
     return (where ~ /\/build\/(gst|ext|tests)\//)
   }
   file = where
   sub(/:[0-9]+$/, "", file)
   return (file in ours_source)
+}
+
+function is_exempt_from_leaks(frame,   symbol) {
+  symbol = frame
+  sub(/^(at|by) 0x[0-9A-Fa-f]+: /, "", symbol)
+  return symbol ~ /^(_dl_init|_dl_open|gst_debug_add_log_function|gst_debug_remove_log_function)[. ]/
+}
+
+function record_leak(what, where, frame,   key) {
+  key = binary SUBSEP "definite leak" SUBSEP where
+  if (key in seen)
+    return
+  seen[key] = 1
+  leak_ours_count++
+  leak_binary[leak_ours_count] = binary
+  leak_what[leak_ours_count] = what
+  leak_frame[leak_ours_count] = frame
 }
 
 function record(kind, where, frame,   key) {
@@ -167,6 +220,9 @@ function record(kind, where, frame,   key) {
   sub(/^[0-9-]+T[0-9:.]+Z /, "", line)
   if (line !~ /^==[0-9]+== /)
     next
+  pid = line
+  sub(/^==/, "", pid)
+  sub(/==.*$/, "", pid)
   sub(/^==[0-9]+== /, "", line)
 }
 
@@ -176,12 +232,18 @@ line ~ /^Command: / {
   sub(/^Command: /, "", binary)
   sub(/ .*$/, "", binary)
   sub(/.*\//, "", binary)
+  # Runs do not nest without --trace-children; see the header.
+  split("", run_of)
+  run_of[pid] = examined
+  run_binary[examined] = binary
   next
 }
 
 line ~ /^[0-9,]+ (\([^)]*\) )?bytes in [0-9,]+ blocks are .*lost/ {
   leak_count++
-  pending = 0
+  pending = (line ~ / are definitely lost/) ? "leak" : 0
+  pending_kind = line
+  sub(/ in loss record .*$/, "", pending_kind)
   candidate = ""
   next
 }
@@ -198,7 +260,7 @@ line ~ /^ *(Address 0x|Uninitialised value was created|Block was alloc|Location 
 }
 
 line ~ /^(Invalid (read|write|free|memory pool|alignment)|Mismatched free|Conditional jump or move depends on uninitialised|Use of uninitialised|Syscall param |Source and destination overlap|Jump to the invalid address|Argument .* has a (fishy|bad)|realloc\(\) with size 0)/ {
-  pending = 1
+  pending = "error"
   pending_kind = line
   sub(/ of size [0-9]+$/, "", pending_kind)
   candidate = ""
@@ -224,9 +286,24 @@ line ~ /^ +(at|by) 0x[0-9A-Fa-f]+: / {
     next
   frame = line
   sub(/^ +/, "", frame)
+  if (pending == "leak") {
+    if (is_exempt_from_leaks(frame)) {
+      pending = 0
+    } else if (is_ours(where)) {
+      record_leak(pending_kind, where, frame)
+      pending = 0
+    }
+    next
+  }
   record(pending_kind, where, frame)
   pending = 0
   next
+}
+
+# No next here: the line still reaches the rule below, as it always has.
+line ~ /^ERROR SUMMARY: / {
+  if (pid in run_of)
+    finished[run_of[pid]] = 1
 }
 
 {
@@ -240,11 +317,33 @@ END {
     exit 1
   }
   printf "valgrind log check: %d error contexts from this repository, ", ours_count
-  printf "%d from libraries, %d leak reports, %d binaries examined\n", library_count, leak_count, examined
+  printf "%d from libraries, %d leak reports, ", library_count, leak_count
+  printf "%d definite leak contexts from this repository, %d binaries examined\n", leak_ours_count, examined
   for (i = 1; i <= unclassified_count; i++)
     printf "::warning::valgrind log check does not classify this report, so it can neither pass nor fail on it: %s\n", unclassified[i]
+  if (leak_ours_count > 0) {
+    print ""
+    print "Definite leaks allocated in this repository:"
+    for (i = 1; i <= leak_ours_count; i++) {
+      printf "  [%s] %s\n", leak_binary[i], leak_what[i]
+      printf "      %s\n", leak_frame[i]
+    }
+  }
+  unfinished = 0
+  if (require_output != "") {
+    for (i = 1; i <= examined; i++) {
+      if (i in finished)
+        continue
+      if (unfinished == 0) {
+        print ""
+        print "Memcheck never finished these runs, so nothing they did was checked:"
+      }
+      unfinished++
+      printf "  [%s] no ERROR SUMMARY: valgrind aborted at startup, was killed, or the log was cut\n", run_binary[i]
+    }
+  }
   if (ours_count == 0)
-    exit 0
+    exit (unfinished > 0 || leak_ours_count > 0)
   print ""
   print "Memcheck errors reported in this repository'\''s own code:"
   for (i = 1; i <= ours_count; i++) {

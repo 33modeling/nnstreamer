@@ -47,6 +47,7 @@ enum
   PROP_TIMEOUT,
   PROP_SILENT,
   PROP_MAX_REQUEST,
+  PROP_MAX_BUFFERS,
 };
 
 #define TCP_HIGHEST_PORT        65535
@@ -56,6 +57,7 @@ enum
 #define DEFAULT_CLIENT_TIMEOUT  0
 #define DEFAULT_SILENT TRUE
 #define DEFAULT_MAX_REQUEST 2
+#define DEFAULT_MAX_BUFFERS 0
 
 GST_DEBUG_CATEGORY_STATIC (gst_tensor_query_client_debug);
 #define GST_CAT_DEFAULT gst_tensor_query_client_debug
@@ -154,6 +156,12 @@ gst_tensor_query_client_class_init (GstTensorQueryClientClass * klass)
           "Two buffers are requested by default, and 0 means that all buffers are sent to query server without drop. ",
           0, G_MAXUINT, DEFAULT_MAX_REQUEST,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_MAX_BUFFERS,
+      g_param_spec_uint ("max-buffers", "Max buffers",
+          "The maximum number of answers from the query server waiting to be pushed. "
+          "If the server sends faster than the client processes, the oldest answer is dropped. "
+          "0 means no limit.", 0, G_MAXUINT, DEFAULT_MAX_BUFFERS,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   gst_element_class_add_pad_template (gstelement_class,
       gst_static_pad_template_get (&sinktemplate));
   gst_element_class_add_pad_template (gstelement_class,
@@ -202,6 +210,8 @@ gst_tensor_query_client_init (GstTensorQueryClient * self)
   self->msg_queue = g_async_queue_new ();
   self->max_request = DEFAULT_MAX_REQUEST;
   self->requested_num = 0;
+  self->max_buffers = DEFAULT_MAX_BUFFERS;
+  self->dropped_num = 0;
   self->is_tensor = FALSE;
   gst_tensors_config_init (&self->config);
 }
@@ -289,6 +299,9 @@ gst_tensor_query_client_set_property (GObject * object, guint prop_id,
     case PROP_MAX_REQUEST:
       self->max_request = g_value_get_uint (value);
       break;
+    case PROP_MAX_BUFFERS:
+      self->max_buffers = g_value_get_uint (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -332,6 +345,9 @@ gst_tensor_query_client_get_property (GObject * object, guint prop_id,
     case PROP_MAX_REQUEST:
       g_value_set_uint (value, self->max_request);
       break;
+    case PROP_MAX_BUFFERS:
+      g_value_set_uint (value, self->max_buffers);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -361,13 +377,9 @@ gst_tensor_query_client_update_caps (GstTensorQueryClient * self,
        * It will be used in chain function, to push tensor buffer into src pad.
        */
       if (ret) {
-        GstStructure *s = gst_caps_get_structure (out_caps, 0);
-
-        self->is_tensor = gst_structure_is_tensor_stream (s);
-        if (self->is_tensor) {
-          gst_tensors_config_free (&self->config);
-          gst_tensors_config_from_structure (&self->config, s);
-        }
+        gst_tensors_config_free (&self->config);
+        self->is_tensor =
+            gst_tensor_query_config_from_caps (out_caps, &self->config);
       }
     } else {
       nns_loge ("out-caps from tensor_query_serversink is not fixed. "
@@ -494,10 +506,25 @@ _nns_edge_event_cb (nns_edge_event_h event_h, void *user_data)
     }
     case NNS_EDGE_EVENT_NEW_DATA_RECEIVED:
     {
-      nns_edge_data_h data;
+      nns_edge_data_h data = NULL;
+      guint dropped;
 
-      nns_edge_event_parse_new_data (event_h, &data);
-      g_async_queue_push (self->msg_queue, data);
+      ret = nns_edge_event_parse_new_data (event_h, &data);
+      if (NNS_EDGE_ERROR_NONE != ret) {
+        nns_loge ("Failed to parse new data received from new data event");
+        break;
+      }
+
+      dropped = gst_tensor_query_push_edge_data (self->msg_queue, data,
+          self->max_buffers);
+      if (dropped > 0) {
+        /* A dropped answer is not pending anymore, see chain(). */
+        if (g_atomic_int_get (&self->dropped_num) < G_MAXINT / 2)
+          g_atomic_int_add (&self->dropped_num,
+              (gint) MIN (dropped, (guint) G_MAXINT / 2));
+        GST_DEBUG_OBJECT (self, "Dropped %u old answers (max-buffers %u).",
+            dropped, self->max_buffers);
+      }
       break;
     }
     default:
@@ -679,7 +706,14 @@ gst_tensor_query_client_chain (GstPad * pad,
   GstMemory *mem[NNS_TENSOR_SIZE_LIMIT];
   GstMapInfo map[NNS_TENSOR_SIZE_LIMIT];
   gchar *val;
+  gint dropped;
   UNUSED (pad);
+
+  dropped = g_atomic_int_get (&self->dropped_num);
+  if (dropped > 0) {
+    g_atomic_int_add (&self->dropped_num, -dropped);
+    self->requested_num -= MIN (self->requested_num, (guint) dropped);
+  }
 
   if (self->max_request > 0 && self->requested_num > self->max_request) {
     nns_logi
@@ -727,7 +761,11 @@ try_pop:
       self->requested_num--;
     ret = nns_edge_data_get_count (data_h, &num_data);
 
-    if (ret == NNS_EDGE_ERROR_NONE && num_data > 0) {
+    if (ret == NNS_EDGE_ERROR_NONE && num_data > 0 && self->is_tensor
+        && !gst_tensor_query_validate_edge_data (data_h, &self->config)) {
+      nns_loge ("The edge data from the server does not match the caps.");
+      res = GST_FLOW_ERROR;
+    } else if (ret == NNS_EDGE_ERROR_NONE && num_data > 0) {
       GstMemory *new_mem;
       GstTensorInfo *_info;
 
@@ -746,16 +784,23 @@ try_pop:
 
         if (self->is_tensor) {
           _info = gst_tensors_info_get_nth_info (&self->config.info, i);
-          gst_tensor_buffer_append_memory (out_buf, new_mem, _info);
+          if (!gst_tensor_buffer_append_memory (out_buf, new_mem, _info)) {
+            g_clear_pointer (&out_buf, gst_buffer_unref);
+            break;
+          }
         } else {
           gst_buffer_append_memory (out_buf, new_mem);
         }
       }
 
-      /* metadata from incoming buffer */
-      gst_buffer_copy_into (out_buf, buf, GST_BUFFER_COPY_METADATA, 0, -1);
+      if (out_buf) {
+        /* metadata from incoming buffer */
+        gst_buffer_copy_into (out_buf, buf, GST_BUFFER_COPY_METADATA, 0, -1);
 
-      res = gst_pad_push (self->srcpad, out_buf);
+        res = gst_pad_push (self->srcpad, out_buf);
+      } else {
+        res = GST_FLOW_ERROR;
+      }
     } else {
       nns_loge ("Failed to get the number of memories of the edge data.");
       res = GST_FLOW_ERROR;
