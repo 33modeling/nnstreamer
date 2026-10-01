@@ -12170,7 +12170,7 @@ TEST (testTensorSplit, finalizeWithoutTensorseg)
   ASSERT_TRUE (split != NULL);
   gst_object_ref_sink (split);
 
-  /* g_array_unref() reports invalid arguments in the GLib domain;
+  /** g_array_unref() reports invalid arguments in the GLib domain;
    * ml_loge() logs to the default domain. */
   glib_handler = g_log_set_handler ("GLib", levels, _record_critical, NULL);
   default_handler = g_log_set_handler (NULL, levels, _record_critical, NULL);
