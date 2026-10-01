@@ -16,6 +16,7 @@
 #include <nnstreamer_util.h>
 #include <tensor_common.h>
 #include <tensor_converter_custom.h>
+#include <unittest_python3_util.h>
 #include <unittest_util.h>
 
 
@@ -718,6 +719,391 @@ TEST (tensorConverterPython, invalidParam6_n)
       "invalid_class_custom_converter.py", NULL);
   EXPECT_NE (0, ex->open (test_model, &py_core));
 
+  g_free (test_model);
+}
+
+/**
+ * @brief Test for python custom converter whose class raises in its constructor
+ */
+TEST (tensorConverterPython, raisingConstructor_n)
+{
+  const gchar *root_path = g_getenv ("NNSTREAMER_SOURCE_ROOT_PATH");
+  const NNStreamerExternalConverter *ex;
+  void *py_core = NULL;
+  gchar *test_model;
+
+  /** supposed to run test in build directory */
+  if (root_path == NULL)
+    root_path = "..";
+
+  ex = nnstreamer_converter_find ("python3");
+  ASSERT_NE (nullptr, ex);
+
+  test_model = g_build_filename (root_path, "tests", "test_models", "models",
+      "raise_init_custom_converter.py", NULL);
+  EXPECT_NE (0, ex->open (test_model, &py_core));
+  EXPECT_EQ (nullptr, py_core);
+
+  if (py_core)
+    ex->close (&py_core);
+  g_free (test_model);
+}
+
+/**
+ * @brief Open the python custom converter with converter_output_cases.py.
+ */
+static const NNStreamerExternalConverter *
+_python_open_output_cases (void **py_core)
+{
+  const gchar *root_path = g_getenv ("NNSTREAMER_SOURCE_ROOT_PATH");
+  const NNStreamerExternalConverter *ex;
+  gchar *test_model;
+
+  /** supposed to run test in build directory */
+  if (root_path == NULL)
+    root_path = "..";
+
+  ex = nnstreamer_converter_find ("python3");
+  test_model = g_build_filename (root_path, "tests", "test_models", "models",
+      "converter_output_cases.py", NULL);
+  if (ex && ex->open (test_model, py_core) != 0)
+    ex = NULL;
+
+  g_free (test_model);
+  return ex;
+}
+
+/**
+ * @brief Convert 8 bytes whose first byte selects the case of converter_output_cases.py.
+ */
+static GstBuffer *
+_python_convert_case (const NNStreamerExternalConverter *ex, void *py_core,
+    guint8 mode, GstTensorsConfig *config)
+{
+  guint8 *in_data = (guint8 *) g_malloc (8);
+  GstBuffer *in_buf, *out_buf;
+
+  in_data[0] = mode;
+  for (guint i = 1; i < 8; i++)
+    in_data[i] = (guint8) i;
+
+  in_buf = gst_buffer_new_wrapped (in_data, 8);
+  out_buf = ex->convert (in_buf, config, py_core);
+  gst_buffer_unref (in_buf);
+
+  return out_buf;
+}
+
+/**
+ * @brief Check that the converted buffer holds the int32 values given.
+ */
+static void
+_python_expect_int32 (GstBuffer *buf, const gint32 *expected, guint num)
+{
+  GstMapInfo map;
+  GstMemory *mem;
+
+  ASSERT_EQ (gst_buffer_n_memory (buf), 1U);
+  mem = gst_buffer_peek_memory (buf, 0);
+  ASSERT_TRUE (gst_memory_map (mem, &map, GST_MAP_READ));
+  EXPECT_EQ (map.size, sizeof (gint32) * num);
+  if (map.size == sizeof (gint32) * num) {
+    EXPECT_EQ (memcmp (map.data, expected, map.size), 0);
+  }
+  gst_memory_unmap (mem, &map);
+}
+
+/**
+ * @brief Python custom converter gives an int32 tensor of its whole byte size
+ */
+TEST (tensorConverterPython, outputInt32)
+{
+  const gint32 expected[4] = { 0, 1, 2, 3 };
+  const NNStreamerExternalConverter *ex;
+  void *py_core = NULL;
+  GstTensorsConfig config;
+  GstBuffer *buf;
+
+  gst_tensors_config_init (&config);
+  ex = _python_open_output_cases (&py_core);
+  ASSERT_NE (nullptr, ex);
+
+  buf = _python_convert_case (ex, py_core, 1, &config);
+  ASSERT_NE (nullptr, buf);
+  EXPECT_EQ (1U, config.info.num_tensors);
+  EXPECT_EQ (_NNS_INT32, config.info.info[0].type);
+  EXPECT_EQ (gst_tensors_info_get_size (&config.info, 0), gst_buffer_get_size (buf));
+  _python_expect_int32 (buf, expected, 4);
+
+  gst_buffer_unref (buf);
+  gst_tensors_config_free (&config);
+  ex->close (&py_core);
+}
+
+/**
+ * @brief Python custom converter gives a non-contiguous tensor in element order
+ */
+TEST (tensorConverterPython, outputNonContiguous)
+{
+  const gint32 expected[4] = { 3, 2, 1, 0 };
+  const NNStreamerExternalConverter *ex;
+  void *py_core = NULL;
+  GstTensorsConfig config;
+  GstBuffer *buf;
+
+  gst_tensors_config_init (&config);
+  ex = _python_open_output_cases (&py_core);
+  ASSERT_NE (nullptr, ex);
+
+  buf = _python_convert_case (ex, py_core, 2, &config);
+  ASSERT_NE (nullptr, buf);
+  _python_expect_int32 (buf, expected, 4);
+
+  gst_buffer_unref (buf);
+  gst_tensors_config_free (&config);
+  ex->close (&py_core);
+}
+
+/**
+ * @brief Python custom converter passes the uint8 input through
+ */
+TEST (tensorConverterPython, outputUint8)
+{
+  const guint8 expected[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
+  const NNStreamerExternalConverter *ex;
+  void *py_core = NULL;
+  GstTensorsConfig config;
+  GstBuffer *buf;
+
+  gst_tensors_config_init (&config);
+  ex = _python_open_output_cases (&py_core);
+  ASSERT_NE (nullptr, ex);
+
+  buf = _python_convert_case (ex, py_core, 0, &config);
+  ASSERT_NE (nullptr, buf);
+  EXPECT_EQ (_NNS_UINT8, config.info.info[0].type);
+  EXPECT_EQ (8U, gst_buffer_get_size (buf));
+  EXPECT_EQ (0, gst_buffer_memcmp (buf, 0, expected, 8));
+
+  gst_buffer_unref (buf);
+  gst_tensors_config_free (&config);
+  ex->close (&py_core);
+}
+
+/**
+ * @brief Negative cases of the python custom converter giving what does not fit
+ * @note 3: raises, 4: not an array, 5: size mismatch, 6: tensor count mismatch,
+ *       7: outputs in a tuple instead of a list
+ */
+TEST (tensorConverterPython, outputInvalid_n)
+{
+  const guint8 modes[] = { 3, 4, 5, 6, 7 };
+  const NNStreamerExternalConverter *ex;
+  void *py_core = NULL;
+  GstTensorsConfig config;
+
+  ex = _python_open_output_cases (&py_core);
+  ASSERT_NE (nullptr, ex);
+
+  for (guint i = 0; i < G_N_ELEMENTS (modes); i++) {
+    GstBuffer *buf;
+
+    gst_tensors_config_init (&config);
+    buf = _python_convert_case (ex, py_core, modes[i], &config);
+    EXPECT_EQ (nullptr, buf) << "mode " << (guint) modes[i];
+    if (buf)
+      gst_buffer_unref (buf);
+    gst_tensors_config_free (&config);
+  }
+
+  /* the converter keeps working after a failure */
+  gst_tensors_config_init (&config);
+  GstBuffer *buf = _python_convert_case (ex, py_core, 1, &config);
+  EXPECT_NE (nullptr, buf);
+  if (buf)
+    gst_buffer_unref (buf);
+  gst_tensors_config_free (&config);
+
+  ex->close (&py_core);
+}
+
+/**
+ * @brief Negative case of the python custom converter with an input it cannot map
+ */
+TEST (tensorConverterPython, unmappableInput_n)
+{
+  const NNStreamerExternalConverter *ex;
+  void *py_core = NULL;
+  GstTensorsConfig config;
+  GstBuffer *in_buf;
+  GstMemory *mem;
+  GstMapInfo map;
+
+  gst_tensors_config_init (&config);
+  ex = _python_open_output_cases (&py_core);
+  ASSERT_NE (nullptr, ex);
+
+  in_buf = gst_buffer_new_wrapped (g_malloc0 (8), 8);
+  mem = gst_buffer_peek_memory (in_buf, 0);
+
+  /* a memory mapped for writing cannot be mapped for reading */
+  ASSERT_TRUE (gst_memory_map (mem, &map, GST_MAP_WRITE));
+  EXPECT_EQ (1, GST_MINI_OBJECT_REFCOUNT_VALUE (mem));
+
+  EXPECT_EQ (nullptr, ex->convert (in_buf, &config, py_core));
+  EXPECT_EQ (1, GST_MINI_OBJECT_REFCOUNT_VALUE (mem));
+
+  gst_memory_unmap (mem, &map);
+  gst_buffer_unref (in_buf);
+  gst_tensors_config_free (&config);
+  ex->close (&py_core);
+}
+
+/**
+ * @brief Arguments of a converting thread
+ */
+typedef struct {
+  const NNStreamerExternalConverter *ex;
+  void *py_core;
+  guint seed;
+  guint rounds;
+  guint mismatch;
+} ConverterThreadData;
+
+/**
+ * @brief Convert in a thread of its own with the instance it was given.
+ * @note Each round alternates between the case giving the array the script module holds and the
+ *       passthrough case, so both what the converter copies and what it hands back are checked.
+ */
+static gpointer
+_python_convert_thread (gpointer user_data)
+{
+  ConverterThreadData *td = (ConverterThreadData *) user_data;
+
+  for (guint i = 0; i < td->rounds; i++) {
+    const gint32 kept[4] = { 0, 1, 2, 3 };
+    guint8 in_data[8];
+    gboolean give_kept = ((i % 2) == 0);
+    gconstpointer expected = give_kept ? (gconstpointer) kept : (gconstpointer) in_data;
+    gsize expected_size = give_kept ? sizeof (kept) : sizeof (in_data);
+    GstTensorsConfig config;
+    GstBuffer *in_buf, *out_buf;
+
+    /* the first byte selects the case of converter_output_cases.py, passing through when above 8 */
+    in_data[0] = give_kept ? 8 : (guint8) (9 + (td->seed + i) % 200);
+    for (guint k = 1; k < sizeof (in_data); k++)
+      in_data[k] = (guint8) (td->seed + i + k);
+
+    gst_tensors_config_init (&config);
+    in_buf = gst_buffer_new_wrapped (
+        _g_memdup (in_data, sizeof (in_data)), sizeof (in_data));
+    out_buf = td->ex->convert (in_buf, &config, td->py_core);
+    gst_buffer_unref (in_buf);
+
+    if (!out_buf || gst_buffer_get_size (out_buf) != expected_size
+        || gst_buffer_memcmp (out_buf, 0, expected, expected_size) != 0)
+      td->mismatch++;
+    if (out_buf)
+      gst_buffer_unref (out_buf);
+    gst_tensors_config_free (&config);
+  }
+
+  return NULL;
+}
+
+/**
+ * @brief Converters running in threads of their own convert correctly and release what they build.
+ */
+TEST (tensorConverterPython, convertMultiThreadKeepsObjects)
+{
+  ConverterThreadData td[4];
+  GThread *threads[4];
+  Py_ssize_t before, after, refs_before, refs_after;
+
+  for (guint t = 0; t < 4; t++) {
+    td[t].py_core = NULL;
+    td[t].ex = _python_open_output_cases (&td[t].py_core);
+    ASSERT_NE (nullptr, td[t].ex);
+    td[t].seed = t * 30;
+    td[t].mismatch = 0;
+    /* warm up the lazy imports of the first conversion outside the measured window */
+    td[t].rounds = 10;
+    _python_convert_thread (&td[t]);
+    td[t].rounds = 300;
+  }
+
+  before = py_test_gc_object_count ();
+  refs_before = py_test_attr_refcount ("converter_output_cases", "KEPT");
+  ASSERT_GT (before, 0);
+  ASSERT_GT (refs_before, 0);
+  for (guint t = 0; t < 4; t++)
+    threads[t] = g_thread_new ("convert", _python_convert_thread, &td[t]);
+  for (guint t = 0; t < 4; t++)
+    g_thread_join (threads[t]);
+  after = py_test_gc_object_count ();
+  refs_after = py_test_attr_refcount ("converter_output_cases", "KEPT");
+
+  for (guint t = 0; t < 4; t++) {
+    EXPECT_EQ (0U, td[t].mismatch);
+    td[t].ex->close (&td[t].py_core);
+  }
+  EXPECT_LE (after - before, PY_TEST_GC_SLACK);
+  EXPECT_EQ (refs_before, refs_after);
+}
+
+/**
+ * @brief Opening the python custom converter again does not grow sys.path.
+ */
+TEST (tensorConverterPython, reopenKeepsSysPath)
+{
+  void *py_core = NULL;
+  const NNStreamerExternalConverter *ex = _python_open_output_cases (&py_core);
+  Py_ssize_t first, last = -1;
+
+  ASSERT_NE (nullptr, ex);
+  ex->close (&py_core);
+  first = py_test_sys_path_length ();
+  ASSERT_GT (first, 0);
+
+  for (guint i = 0; i < 20; i++) {
+    ex = _python_open_output_cases (&py_core);
+    ASSERT_NE (nullptr, ex);
+    ex->close (&py_core);
+    last = py_test_sys_path_length ();
+  }
+
+  EXPECT_EQ (first, last);
+}
+
+/**
+ * @brief A script that fails to load neither opens the converter nor grows sys.path.
+ */
+TEST (tensorConverterPython, openInvalidScriptKeepsSysPath_n)
+{
+  const gchar *root_path = g_getenv ("NNSTREAMER_SOURCE_ROOT_PATH");
+  const NNStreamerExternalConverter *ex = nnstreamer_converter_find ("python3");
+  gchar *test_model;
+  Py_ssize_t first = -1, last = -1;
+
+  /** supposed to run test in build directory */
+  if (root_path == NULL)
+    root_path = "..";
+
+  ASSERT_NE (nullptr, ex);
+  test_model = g_build_filename (root_path, "tests", "test_models", "models",
+      "NOT_EXIST_converter.py", NULL);
+  for (guint i = 0; i < 10; i++) {
+    void *py_core = NULL;
+
+    EXPECT_NE (0, ex->open (test_model, &py_core));
+    EXPECT_EQ (nullptr, py_core);
+    if (i == 0)
+      first = py_test_sys_path_length ();
+    last = py_test_sys_path_length ();
+  }
+
+  EXPECT_GT (first, 0);
+  EXPECT_EQ (first, last);
   g_free (test_model);
 }
 

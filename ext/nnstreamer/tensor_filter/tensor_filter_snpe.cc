@@ -46,6 +46,40 @@ namespace nnstreamer
 {
 namespace tensor_filter_snpe
 {
+namespace
+{
+/**
+ * @brief RAII guard releasing a GLib allocation when its scope ends.
+ * @tparam T pointer type of the guarded allocation
+ * @tparam F GLib function releasing it
+ */
+template <typename T, void (*F) (T)> class glib_scoped
+{
+  public:
+  /** @brief Guard the given allocation. */
+  explicit glib_scoped (T ptr) : ptr_ (ptr)
+  {
+  }
+  /** @brief Release the guarded allocation. */
+  ~glib_scoped ()
+  {
+    F (ptr_);
+  }
+  /** @brief Not copy constructible. */
+  glib_scoped (const glib_scoped &) = delete;
+  /** @brief Not copy assignable. */
+  glib_scoped &operator= (const glib_scoped &) = delete;
+
+  private:
+  T ptr_;
+};
+
+/** @brief Guard for a string vector allocated by g_strsplit(). */
+using strv_scoped = glib_scoped<gchar **, g_strfreev>;
+/** @brief Guard for a string allocated by g_strjoinv(). */
+using str_scoped = glib_scoped<gpointer, g_free>;
+} /* namespace */
+
 extern "C" {
 void init_filter_snpe (void) __attribute__ ((constructor));
 void fini_filter_snpe (void) __attribute__ ((destructor));
@@ -199,6 +233,7 @@ snpe_subplugin::configure_instance (const GstTensorFilterProperties *prop)
       throw std::runtime_error ("Error obtaining buffer attributes");
 
     auto default_type = Snpe_IBufferAttributes_GetEncodingType (bufferAttributesOpt);
+    const char *type_error = nullptr;
 
     /* parse tensor data type with user given element type */
     switch (type) {
@@ -210,7 +245,7 @@ snpe_subplugin::configure_instance (const GstTensorFilterProperties *prop)
         } else if (default_type == SNPE_USERBUFFERENCODING_ELEMENTTYPE_TF8) {
           info->type = _NNS_UINT8;
         } else {
-          throw std::invalid_argument ("Unsupported data type");
+          type_error = "Unsupported data type";
         }
         break;
       case SNPE_USERBUFFERENCODING_ELEMENTTYPE_FLOAT:
@@ -219,12 +254,16 @@ snpe_subplugin::configure_instance (const GstTensorFilterProperties *prop)
       case SNPE_USERBUFFERENCODING_ELEMENTTYPE_TF8:
         info->type = _NNS_UINT8;
         if (default_type == SNPE_USERBUFFERENCODING_ELEMENTTYPE_FLOAT) {
-          throw std::invalid_argument (
-              "ERROR: Quantization parameters are not present in model. Use TF8 type.");
+          type_error = "ERROR: Quantization parameters are not present in model. Use TF8 type.";
         }
         break;
       default:
-        throw std::invalid_argument ("Unsupported data type");
+        type_error = "Unsupported data type";
+    }
+
+    if (type_error) {
+      Snpe_IBufferAttributes_Delete (bufferAttributesOpt);
+      throw std::invalid_argument (type_error);
     }
 
     /* parse tensor dimension */
@@ -259,7 +298,6 @@ snpe_subplugin::configure_instance (const GstTensorFilterProperties *prop)
           = Snpe_UserBufferEncodingTfN_GetQuantizedStepSize (ubeTfNHandle);
       ube_h = Snpe_UserBufferEncodingTfN_Create (stepEquivalentTo0, quantizedStepSize, 8);
       Snpe_IBufferAttributes_Delete (bufferAttributesOpt);
-      Snpe_UserBufferEncodingTfN_Delete (ubeTfNHandle);
     } else if (type == SNPE_USERBUFFERENCODING_ELEMENTTYPE_FLOAT) {
       ube_h = Snpe_UserBufferEncodingFloat_Create ();
     }
@@ -281,9 +319,11 @@ snpe_subplugin::configure_instance (const GstTensorFilterProperties *prop)
       return;
 
     gchar **options = g_strsplit (custom_prop, ",", -1);
+    strv_scoped options_scope (options);
 
     for (guint op = 0; op < g_strv_length (options); ++op) {
       gchar **option = g_strsplit (options[op], ":", -1);
+      strv_scoped option_scope (option);
 
       if (g_strv_length (option) > 1) {
         g_strstrip (option[0]);
@@ -305,8 +345,13 @@ snpe_subplugin::configure_instance (const GstTensorFilterProperties *prop)
         } else if (g_ascii_strcasecmp (option[0], "OutputTensor") == 0) {
           /* the tensor name may contain ':' */
           gchar *_ot_str = g_strjoinv (":", &option[1]);
+          str_scoped ot_str_scope (_ot_str);
           gchar **names = g_strsplit (_ot_str, ";", -1);
+          strv_scoped names_scope (names);
           guint num_names = g_strv_length (names);
+
+          if (outputstrListHandle)
+            Snpe_StringList_Delete (outputstrListHandle);
           outputstrListHandle = Snpe_StringList_Create ();
           for (guint i = 0; i < num_names; ++i) {
             if (g_strcmp0 (names[i], "") == 0) {
@@ -320,10 +365,9 @@ snpe_subplugin::configure_instance (const GstTensorFilterProperties *prop)
               throw std::runtime_error (err_msg);
             }
           }
-          g_free (_ot_str);
-          g_strfreev (names);
         } else if (g_ascii_strcasecmp (option[0], "OutputType") == 0) {
           gchar **types = g_strsplit (option[1], ";", -1);
+          strv_scoped types_scope (types);
           guint num_types = g_strv_length (types);
           for (guint i = 0; i < num_types; ++i) {
             if (g_ascii_strcasecmp (types[i], "FLOAT32") == 0) {
@@ -334,9 +378,9 @@ snpe_subplugin::configure_instance (const GstTensorFilterProperties *prop)
               nns_logw ("Ignore unknown output type (%s)", types[i]);
             }
           }
-          g_strfreev (types);
         } else if (g_ascii_strcasecmp (option[0], "InputType") == 0) {
           gchar **types = g_strsplit (option[1], ";", -1);
+          strv_scoped types_scope (types);
           guint num_types = g_strv_length (types);
           for (guint i = 0; i < num_types; ++i) {
             if (g_ascii_strcasecmp (types[i], "FLOAT32") == 0) {
@@ -347,16 +391,11 @@ snpe_subplugin::configure_instance (const GstTensorFilterProperties *prop)
               nns_logw ("Ignore unknown input type (%s)", types[i]);
             }
           }
-          g_strfreev (types);
         } else {
           nns_logw ("Unknown option (%s).", options[op]);
         }
       }
-
-      g_strfreev (option);
     }
-
-    g_strfreev (options);
   };
 
   configured = true;

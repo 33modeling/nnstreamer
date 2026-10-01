@@ -21,6 +21,7 @@ title: tensor_converter
 - Octet stream: direct conversion of application/octet-stream.
   - Octet stream to static tensor: You should set ```input-type``` and ```input-dim``` to describe tensor(s) information of outgoing buffer.
     If setting multiple tensors, converter will divide incoming buffer and set multiple memory chunks in outgoing buffer.
+    The size of each incoming buffer should be a multiple of the frame size given by these properties; otherwise, converter posts an error and stops the stream.
 
     e.g, converting 10 bytes of octet stream to 2 static tensors:
 
@@ -113,6 +114,7 @@ $ gst-launch videotestsrc ! video/x-raw,format=RGB,width=640,height=480 ! tensor
 
 ### flexbuffers to tensors stream
 Convert to flexbuffers using tensor decoder and then convert back to tensors stream.
+* Note: the blob of each tensor should hold exactly the bytes of that tensor. A producer written in Python should pass the bytes of its array (`array.tobytes()`), because `flexbuffers.Builder.Blob()` records the length of what it is given, which is the number of elements for a numpy array.
 ```
 $ gst-launch videotestsrc ! video/x-raw,format=RGB,width=640,height=480 ! tensor_converter ! tensor_decoder mode=flexbuf ! tensor_converter ! tensor_sink
 ```
@@ -154,6 +156,8 @@ class CustomConverter(object):
     ## Write a code to convert any media type to tensors.
     return (tensors_info, out_array, rate_n, rate_d)
 ```
+`out_array` is a list of numpy arrays, one for each entry of `tensors_info`, and each array has to hold exactly as many bytes as its tensor (its dtype may differ, e.g., a `uint8` array of the raw bytes). Otherwise the conversion fails with a stream error.
+
 Example pipeline
 ```
 ... (any media stream) ! tensor_converter mode=custom-script:custom_converter_example.py ! (tensors) ...

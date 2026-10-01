@@ -117,7 +117,7 @@ typedef struct _GstTensorFilterProperties
   int num_models; /**< number of model files. Some frameworks need multiple model files to initialize the graph (caffe, caffe2) */
 
   int input_configured; /**< TRUE if input tensor is configured. Use int instead of gboolean because this is referred by custom plugins. */
-  GstTensorsInfo input_meta; /**< configured input tensor info */
+  GstTensorsInfo input_meta; /**< configured input tensor info. With invoke_dynamic and a flexible input, tensor-filter updates the type and dimension of each tensor from its meta header before invoke; otherwise a flexible input is checked against it and it is left as configured. */
   tensors_layout input_layout; /**< data layout info provided as a property to tensor_filter for the input, defaults to _NNS_LAYOUT_ANY for all the tensors */
   unsigned int input_ranks[NNS_TENSOR_SIZE_LIMIT];  /**< the rank list of input tensors, it is calculated based on the dimension string. */
 
@@ -303,7 +303,11 @@ struct _GstTensorFilterFramework
        * @param[in/out] private_data A subplugin may save its internal private data here. The subplugin is responsible for alloc/free of this pointer.
        * @param[in] input The array of input tensors. Allocated and filled by tensor_filter/main
        * @param[out] output The array of output tensors. Allocated by tensor_filter/main and to be filled by invoke_NN. If allocate_in_invoke is TRUE, sub-plugin should allocate the memory block for output tensor. (data in GstTensorMemory)
-       * @return 0 if OK. non-zero if error.
+       * @return 0 if OK. Negative to fail the buffer, which makes tensor_filter
+       *         post an 'invoke-failure' application message and stop the flow;
+       *         positive to drop it. Neither unloads the sub-plugin: private_data
+       *         must stay valid for the next call to any callback. Release it in
+       *         close(), never here.
        */
 
       int (*getInputDimension) (const GstTensorFilterProperties * prop,
@@ -407,7 +411,11 @@ struct _GstTensorFilterFramework
        * @param[in/out] private_data A subplugin may save its internal private data here. The subplugin is responsible for alloc/free of this pointer.
        * @param[in] input The array of input tensors. Allocated and filled by tensor_filter/main
        * @param[out] output The array of output tensors. Allocated by tensor_filter/main and to be filled by invoke. If allocate_in_invoke is TRUE, sub-plugin should allocate the memory block for output tensor. (data in GstTensorMemory)
-       * @return 0 if OK. non-zero if error.
+       * @return 0 if OK. Negative to fail the buffer, which makes tensor_filter
+       *         post an 'invoke-failure' application message and stop the flow;
+       *         positive to drop it. Neither unloads the sub-plugin: private_data
+       *         must stay valid for the next call to any callback. Release it in
+       *         close(), never here.
        */
 
       int (*getFrameworkInfo) (const GstTensorFilterFramework * self,
@@ -593,6 +601,11 @@ nnstreamer_filter_shared_model_remove (void *instance, const char *key,
  * @param[in] interpreter The new interpreter to replace.
  * @param[in] replace_callback The callback function to replace with new interpreter.
  * @param[in] free_callback The callback function to destroy the old interpreter.
+ * @note The old interpreter is destroyed even if `replace_callback` does not take the new one.
+ *       The caller should verify every instance can take the new interpreter before calling this.
+ *       Such a check cannot be conclusive while it runs outside this lock: whatever it compares
+ *       may change before the callbacks run. Closing that gap needs the callback to report the
+ *       refusal so that `free_callback` can be skipped.
  */
 extern void
 nnstreamer_filter_shared_model_replace (void *instance, const char *key,
@@ -609,7 +622,7 @@ nnstreamer_filter_shared_model_replace (void *instance, const char *key,
  * Failure to do so will result in undefined behavior, as no callback and handle will be registered.
  *
  * @param[in] prop GstTensorFilterProperties object.
- * @param[in] output The GstTensorMemory holding the asynchronously generated output. Note that this function takes the ownership of each tensor data.
+ * @param[in] output The GstTensorMemory array holding the asynchronously generated output, one entry for each tensor prop->output_meta describes. Note that this function takes the ownership of each tensor data. When no callback is registered, e.g., once tensor-filter has stopped, the data is released with g_free().
  */
 extern void
 nnstreamer_filter_dispatch_output_async (GstTensorFilterProperties * prop, GstTensorMemory * output);

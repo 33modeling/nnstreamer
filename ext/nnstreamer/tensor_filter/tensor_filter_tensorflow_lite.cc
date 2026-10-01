@@ -213,6 +213,12 @@ class TFLiteInterpreter
   {
     return &outputTensorMeta;
   }
+  /** @brief check other has the same input and output tensor meta (hold this lock; other is only read) */
+  gboolean hasSameTensorsInfo (TFLiteInterpreter *other)
+  {
+    return gst_tensors_info_is_equal (&inputTensorMeta, other->getInputTensorsInfo ())
+           && gst_tensors_info_is_equal (&outputTensorMeta, other->getOutputTensorsInfo ());
+  }
 
   /** @brief lock this interpreter */
   void lock ()
@@ -249,8 +255,10 @@ class TFLiteInterpreter
   QNNBackendType qnn_backend_type; /**< QNN Delegate backend type */
   QNNPerformanceMode qnn_performance_mode; /**< QNN Delegate performance mode */
 
-  std::unique_ptr<tflite::Interpreter> interpreter;
+  /* The interpreter uses the delegate and the model: declare it last so it is destroyed first. */
+  tflite::Interpreter::TfLiteDelegatePtr delegate_ptr; /**< single delegate supported */
   std::unique_ptr<tflite::FlatBufferModel> model;
+  std::unique_ptr<tflite::Interpreter> interpreter;
 
   GstTensorsInfo inputTensorMeta; /**< The tensor info of input tensors */
   GstTensorsInfo outputTensorMeta; /**< The tensor info of output tensors */
@@ -261,7 +269,6 @@ class TFLiteInterpreter
   int getTensorDim (int tensor_idx, tensor_dim dim);
   int setTensorProp (const std::vector<int> &tensor_idx_list, GstTensorsInfo *tensorMeta);
 
-  tflite::Interpreter::TfLiteDelegatePtr delegate_ptr; /**< single delegate supported */
   friend class TFLiteCore;
 };
 
@@ -455,13 +462,14 @@ int
 TFLiteInterpreter::loadModel (int num_threads, tflite_delegate_e delegate_e)
 {
   TfLiteDelegate *delegate;
+  std::unique_ptr<tflite::FlatBufferModel> new_model;
 #if (DBG)
   gint64 start_time, stop_time;
   start_time = g_get_monotonic_time ();
 #endif
 
-  model = tflite::FlatBufferModel::BuildFromFile (model_path);
-  if (!model) {
+  new_model = tflite::FlatBufferModel::BuildFromFile (model_path);
+  if (!new_model) {
     ml_loge ("Failed to mmap model\n");
     return -1;
   }
@@ -472,6 +480,7 @@ TFLiteInterpreter::loadModel (int num_threads, tflite_delegate_e delegate_e)
    */
 
   interpreter = nullptr;
+  model = std::move (new_model);
 
 #ifdef TFLITE_RESOLVER_WITHOUT_DEFAULT_DELEGATES
   tflite::ops::builtin::BuiltinOpResolverWithoutDefaultDelegates resolver;
@@ -1259,18 +1268,12 @@ int
 TFLiteCore::reloadInterpreter (TFLiteInterpreter *new_interpreter)
 {
   TFLiteInterpreter *old_interpreter = interpreter;
-  gboolean in_matched, out_matched;
   int ret = 0;
 
   old_interpreter->lock ();
   new_interpreter->lock ();
 
-  in_matched = gst_tensors_info_is_equal (old_interpreter->getInputTensorsInfo (),
-      new_interpreter->getInputTensorsInfo ());
-  out_matched = gst_tensors_info_is_equal (old_interpreter->getOutputTensorsInfo (),
-      new_interpreter->getOutputTensorsInfo ());
-
-  if (!in_matched || !out_matched) {
+  if (!old_interpreter->hasSameTensorsInfo (new_interpreter)) {
     ml_loge ("The model has unmatched tensors info\n");
     ret = -EINVAL;
   } else {
@@ -1315,6 +1318,7 @@ TFLiteCore::reloadModel (const char *_model_path)
   TFLiteInterpreter *interpreter_sub = new TFLiteInterpreter ();
   const char *_ext_delegate_path;
   GHashTable *_ext_delegate_kv;
+  gboolean compatible;
 
   interpreter_sub->setModelPath (_model_path);
   interpreter->getExtDelegate (&_ext_delegate_path, &_ext_delegate_kv);
@@ -1342,6 +1346,16 @@ TFLiteCore::reloadModel (const char *_model_path)
   }
 
   if (shared_tensor_filter_key) {
+    /* The helper frees the old interpreter even if a core refuses the new one. */
+    interpreter->lock ();
+    compatible = interpreter->hasSameTensorsInfo (interpreter_sub);
+    interpreter->unlock ();
+
+    if (!compatible) {
+      ml_loge ("The model has unmatched tensors info, the shared model is not reloaded\n");
+      goto error;
+    }
+
     /* update cores with new interpreter that has shared key */
     nnstreamer_filter_shared_model_replace (this, shared_tensor_filter_key,
         interpreter_sub, replace_interpreter, free_interpreter);
@@ -1441,6 +1455,7 @@ tflite_parseCustomOption (const GstTensorFilterProperties *prop, tflite_option_s
           else
             ml_logw ("Unknown option to set tensorflow-lite delegate (%s).", pair[1]);
         } else if (g_ascii_strcasecmp (pair[0], "ExtDelegateLib") == 0) {
+          g_free ((gpointer) option->ext_delegate_path);
           option->ext_delegate_path = g_strdup (pair[1]);
         } else if (g_ascii_strcasecmp (pair[0], "ExtDelegateKeyVal") == 0) {
           gchar **kvpairs;

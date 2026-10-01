@@ -146,9 +146,21 @@ PYDecoderCore::decode (const GstTensorsConfig *config,
         = { (npy_intp) (input[i].size / gst_tensor_get_element_size (nns_type)) };
     PyObject *input_array = PyArray_SimpleNewFromData (
         1, input_dims, getNumpyType (nns_type), input[i].data);
+    if (!input_array) {
+      Py_ERRMSG ("Cannot pass the tensor %u (%s) to 'decode' of the python3 decoder.\n",
+          i, gst_tensor_get_type_string (nns_type));
+      ret = GST_FLOW_ERROR;
+      goto done;
+    }
     PyList_SetItem (raw_data, i, input_array);
 
     PyObject *shape = PyTensorShape_New (shape_cls, _info);
+    if (!shape) {
+      Py_ERRMSG ("Cannot pass the shape of the tensor %u to 'decode' of the python3 decoder.\n",
+          i);
+      ret = GST_FLOW_ERROR;
+      goto done;
+    }
     PyList_SetItem (in_info, i, shape);
   }
 
@@ -161,26 +173,46 @@ PYDecoderCore::decode (const GstTensorsConfig *config,
   output = PyObject_CallMethod (core_obj, "decode", "OOii", raw_data, in_info, rate_n, rate_d);
 
   if (output) {
+    if (!PyBytes_Check (output)) {
+      ml_loge ("'decode' of the python3 decoder has to return bytes, not '%s'.\n",
+          Py_TYPE (output)->tp_name);
+      ret = GST_FLOW_ERROR;
+      goto done;
+    }
+
     need_alloc = (gst_buffer_get_size (outbuf) == 0);
-    mem_size = PyBytes_Size (output);
+    mem_size = PyBytes_GET_SIZE (output);
 
     if (need_alloc) {
       out_mem = gst_allocator_alloc (NULL, mem_size, NULL);
     } else {
       if (gst_buffer_get_size (outbuf) < mem_size) {
-        gst_buffer_set_size (outbuf, mem_size);
+        gsize offset, maxsize;
+
+        gst_buffer_get_sizes (outbuf, &offset, &maxsize);
+        if (maxsize >= offset + mem_size)
+          gst_buffer_set_size (outbuf, mem_size);
       }
       out_mem = gst_buffer_get_all_memory (outbuf);
     }
 
     if (!gst_memory_map (out_mem, &out_info, GST_MAP_WRITE)) {
       gst_memory_unref (out_mem);
-      nns_loge ("Cannot map gst memory (tensor decoder flexbuf)\n");
+      nns_loge ("Cannot map gst memory (tensor decoder python3)\n");
       ret = GST_FLOW_ERROR;
       goto done;
     }
 
-    memcpy (out_info.data, PyBytes_AsString (output), mem_size);
+    if (out_info.size < mem_size) {
+      ml_loge ("The output buffer (%zu bytes) cannot hold the %zu bytes 'decode' of the python3 decoder returned.\n",
+          out_info.size, mem_size);
+      gst_memory_unmap (out_mem, &out_info);
+      gst_memory_unref (out_mem);
+      ret = GST_FLOW_ERROR;
+      goto done;
+    }
+
+    memcpy (out_info.data, PyBytes_AS_STRING (output), mem_size);
 
     gst_memory_unmap (out_mem, &out_info);
 
@@ -191,11 +223,14 @@ PYDecoderCore::decode (const GstTensorsConfig *config,
 
     Py_SAFEDECREF (output);
   } else {
-    Py_ERRMSG ("Fail to get output from 'convert'");
+    Py_ERRMSG ("Fail to get output from 'decode'");
     ret = GST_FLOW_ERROR;
   }
 
 done:
+  Py_SAFEDECREF (output);
+  Py_SAFEDECREF (raw_data);
+  Py_SAFEDECREF (in_info);
   Py_UNLOCK ();
   return ret;
 }
@@ -219,6 +254,13 @@ PYDecoderCore::getOutCaps (const GstTensorsConfig *config)
   }
 
   result = PyObject_CallMethod (core_obj, (char *) "getOutCaps", NULL);
+  if (result && !PyBytes_Check (result)) {
+    ml_loge ("'getOutCaps' of the python3 decoder has to return bytes, not '%s'.\n",
+        Py_TYPE (result)->tp_name);
+    Py_SAFEDECREF (result);
+    goto done;
+  }
+
   if (result) {
     gchar *caps_str = PyBytes_AsString (result);
     caps = gst_caps_from_string (caps_str);
@@ -277,7 +319,8 @@ decoder_py_exit (void **pdata)
 {
   PYDecoderCore *core = static_cast<PYDecoderCore *> (*pdata);
 
-  g_return_if_fail (core != NULL);
+  if (core == NULL)
+    return;
 
   PyGILGuard gil_guard;
   delete core;
@@ -346,9 +389,15 @@ decoder_py_getOutCaps (void **pdata, const GstTensorsConfig *config)
   GstCaps *caps;
   PYDecoderCore *core = static_cast<PYDecoderCore *> (*pdata);
 
+  if (core == NULL) {
+    ml_loge ("The python3 decoder has no script loaded; set option1 to a valid script.\n");
+    return NULL;
+  }
+
   PyGILGuard gil_guard;
   caps = core->getOutCaps (config);
-  setFramerateFromConfig (caps, config);
+  if (caps)
+    setFramerateFromConfig (caps, config);
   return caps;
 }
 
@@ -362,6 +411,11 @@ decoder_py_decode (void **pdata, const GstTensorsConfig *config,
   g_return_val_if_fail (config, GST_FLOW_ERROR);
   g_return_val_if_fail (input, GST_FLOW_ERROR);
   g_return_val_if_fail (outbuf, GST_FLOW_ERROR);
+
+  if (core == NULL) {
+    ml_loge ("The python3 decoder has no script loaded; set option1 to a valid script.\n");
+    return GST_FLOW_ERROR;
+  }
 
   PyGILGuard gil_guard;
   ret = core->decode (config, input, outbuf);

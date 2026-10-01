@@ -92,6 +92,15 @@ callCompareTest palm_detection_result_golden.0 palm_detection_result_0.log 5-0 "
 callCompareTest palm_detection_result_golden.1 palm_detection_result_1.log 5-1 "palm detection Decode 1 (with config_file.2)" 0
 rm palm_detection_result_*.log
 
+## option3 with the threshold only generates the anchors of the default layers and strides
+gstTest "--gst-plugin-path=${PATH_TO_PLUGIN} tensor_mux name=mux ! tensor_decoder mode=bounding_boxes option1=mp-palm-detection option3=0.5 option4=160:120 option5=300:300 ! videoconvert !  video/x-raw,format=RGBA ! multifilesink location=palm_detection_result_%1d.log \
+    multifilesrc location=palm_detection_input_0.%1d start-index=$CASESTART stop-index=$CASEEND caps=application/octet-stream ! tensor_converter input-dim=18:2016:1:1 input-type=float32 ! mux.sink_0 \
+    multifilesrc location=palm_detection_input_1.%1d start-index=$CASESTART stop-index=$CASEEND caps=application/octet-stream ! tensor_converter input-dim=1:2016:1:1 input-type=float32 ! mux.sink_1" 5-2 0 0 $PERFORMANCE
+
+callCompareTest palm_detection_result_golden.0 palm_detection_result_0.log 5-3 "palm detection Decode 0 (option3 with the threshold only)" 0
+callCompareTest palm_detection_result_golden.1 palm_detection_result_1.log 5-4 "palm detection Decode 1 (option3 with the threshold only)" 0
+rm palm_detection_result_*.log
+
 # yolov5 decoder test
 ## wrong tensor dimension
 gstTest "--gst-plugin-path=${PATH_TO_PLUGIN} multifilesrc location=yolov5_decoder_input.raw start-index=0 stop-index=0 caps=application/octet-stream ! tensor_converter input-dim=85:10647:1 input-type=float32 ! tensor_decoder mode=bounding_boxes option1=yolov5 option2=coco-80.txt option3=0:0.25:0.45 option4=320:320 option5=320:320 option6=0 option7=1 ! fakesink" "6 yolov5 decoder_n" 0 1
@@ -118,11 +127,24 @@ gstTest "--gst-plugin-path=${PATH_TO_PLUGIN} multifilesrc location=yolov8_decode
 
 callCompareTest yolov8_result_golden.raw yolov8_result_0.log "8 diff" "yolov8 golden" 0
 
+## two yolov8 decoders of different model sizes in one pipeline: each keeps its own option5
+gstTest "--gst-plugin-path=${PATH_TO_PLUGIN} multifilesrc location=yolov8_decoder_input.raw caps=application/octet-stream start-index=0 stop-index=0 ! tensor_converter input-dim=84:2100:1 input-type=float32 ! tensor_decoder mode=bounding_boxes option1=yolov8 option2=coco-80.txt option3=0:0.25:0.45 option4=320:320 option5=320:320 option6=0 option7=1 ! videoconvert ! video/x-raw,format=RGBA ! multifilesink location=yolov8_two_decoders_result_%1d.log  multifilesrc location=yolov8_decoder_input.raw caps=application/octet-stream start-index=0 stop-index=0 ! tensor_converter input-dim=84:525:1 input-type=float32 ! tensor_decoder mode=bounding_boxes option1=yolov8 option2=coco-80.txt option3=0:0.25:0.45 option4=160:160 option5=160:160 ! fakesink" "8-2 yolov8 two decoders" 0 0
+
+callCompareTest yolov8_result_golden.raw yolov8_two_decoders_result_0.log "8-2 diff" "yolov8 golden with another yolov8 decoder" 0
+
 # yolov10 decoder test
 ## wrong tensor dimension
 gstTest "--gst-plugin-path=${PATH_TO_PLUGIN} multifilesrc location=yolov10_decoder_input.raw caps=application/octet-stream start-index=0 stop-index=0 ! tensor_converter input-dim=4:300:1 input-type=float32 ! tensor_decoder mode=bounding_boxes option1=yolov10 option2=coco-80.txt option3=0:0.25:0.45 option4=320:320 option5=320:320 option6=0 option7=1 ! fakesink" "9 yolov10 decoder dim_n" 0 1
 
 ## wrong tensor type
+## Under valgrind this pipeline sometimes never returns, and every stall of
+## the memory-checked run of this suite has been this one case. Left
+## unbounded on purpose: gstTest's timeout terminates, and on TERM valgrind
+## still writes the summaries that make check_valgrind_log.sh read a killed
+## run as a clean one, so a bound here would turn the stall into a green run
+## with nothing to show for it. The step's own budget bounds the cost. The
+## refusal is pinned without a pipeline by
+## tensorDecoderBoundingBox.yoloV10RejectsIntegerInput_n.
 gstTest "--gst-plugin-path=${PATH_TO_PLUGIN} multifilesrc location=yolov10_decoder_input.raw caps=application/octet-stream start-index=0 stop-index=0 ! tensor_converter input-dim=6:300:1 input-type=float32 ! tensor_transform mode=typecast option=int32 ! tensor_decoder mode=bounding_boxes option1=yolov10 option2=coco-80.txt option3=0:0.25:0.45 option4=320:320 option5=320:320 ! fakesink" "9 yolov10 decoder type_n" 0 1
 
 gstTest "--gst-plugin-path=${PATH_TO_PLUGIN} multifilesrc location=yolov10_decoder_input.raw caps=application/octet-stream start-index=0 stop-index=0 ! tensor_converter input-dim=6:300:1 input-type=float32 ! tensor_decoder mode=bounding_boxes option1=yolov10 option2=coco-80.txt option3=0:0.25 option4=320:320 option5=320:320 option6=0 option7=1 ! videoconvert ! video/x-raw,format=RGBA ! multifilesink location=yolov10_result_%1d.log" "9 yolov10 decoder" 0 0
@@ -169,9 +191,7 @@ rm mobilenetssd_short_output.log
 rm yolov*.log
 
 # The decoder scales the decoded boxes by the model input dimension of option5,
-# so a missing or unparsable one used to divide by zero on the first box. These
-# cases need a process of their own: the box properties are shared per process,
-# so within one process an earlier pipeline's option5 is still in place.
+# so a missing or unparsable one used to divide by zero on the first box.
 MODELSIZE_SRC="multifilesrc name=fs1 location=mobilenetssd_tensors.0.%d start-index=$CASESTART stop-index=$CASEEND caps=application/octet-stream ! tensor_converter input-dim=4:1:1917:1 input-type=float32 ! mux.sink_0  multifilesrc name=fs2 location=mobilenetssd_tensors.1.%d start-index=$CASESTART stop-index=$CASEEND caps=application/octet-stream ! tensor_converter input-dim=91:1917:1 input-type=float32 ! mux.sink_1"
 MODELSIZE_DEC="tensor_mux name=mux ! tensor_decoder mode=bounding_boxes option1=mobilenet-ssd option2=coco_labels_list.txt option3=box_priors.txt option4=160:120"
 

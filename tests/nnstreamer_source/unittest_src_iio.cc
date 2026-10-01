@@ -590,6 +590,68 @@ build_dev_dir_scan_elements (iio_dev_dir_struct *iio_dev, const guint num_bits,
 }
 
 /**
+ * @brief build scan data elements dir with an exact storage size
+ * @param[in] iio_dev struct of iio device
+ * @param[in] num_bits num of bits used and stored for the data, multiple of 8
+ * @param[in] value data stored in every channel
+ * @returns 0 on success, non-zero on failure
+ * @note the IIO ABI also allows a storage size of 3, 5, 6 and 7 bytes, which
+ * build_dev_dir_scan_elements() cannot describe as it rounds the size up
+ */
+static gint
+build_dev_dir_scan_elements_exact (
+    iio_dev_dir_struct *iio_dev, const guint num_bits, const guint64 value)
+{
+  gint status = 0;
+  gchar *type_data;
+  gchar endianchar, signchar;
+  guint num_bytes, byte_idx;
+  guint8 data_byte;
+  gsize data_size;
+  gchar *scan_el_data;
+  gint location = 0;
+
+  if (!g_file_test (iio_dev->scan_el, G_FILE_TEST_IS_DIR)) {
+    status += g_mkdir_with_parents (iio_dev->scan_el, 0777);
+  }
+
+  num_bytes = ((num_bits - 1) >> 3) + 1;
+  data_size = num_bytes * iio_dev->num_scan_elements;
+  scan_el_data = (gchar *) g_malloc0 (data_size);
+  if (scan_el_data == NULL) {
+    return -1;
+  }
+
+  for (int idx = 0; idx < iio_dev->num_scan_elements; idx++) {
+    endianchar = (idx % 2) ? 'l' : 'b';
+    signchar = (idx % 4 < 2) ? 's' : 'u';
+
+    status += write_file_int (iio_dev->scan_el_en[idx], 1);
+    status += write_file_int (iio_dev->scan_el_index[idx], idx);
+    type_data = g_strdup_printf (
+        "%ce:%c%u/%u>>0", endianchar, signchar, num_bits, num_bytes * 8);
+    status += write_file_string (iio_dev->scan_el_type[idx], type_data);
+    g_free (type_data);
+
+    for (byte_idx = 0; byte_idx < num_bytes; byte_idx++) {
+      data_byte = (guint8) ((value >> (8 * byte_idx)) & 0xFF);
+      if (endianchar == 'l') {
+        scan_el_data[location + byte_idx] = data_byte;
+      } else {
+        scan_el_data[location + num_bytes - 1 - byte_idx] = data_byte;
+      }
+    }
+    location += num_bytes;
+  }
+
+  status += write_file_string_single_trigger (
+      iio_dev->dev_device_dir_fd, scan_el_data, data_size);
+  g_free (scan_el_data);
+
+  return status;
+}
+
+/**
  * @brief build timestamp in scan data elements dir for iio device simulation
  * @param[in] iio_dev struct of iio device
  * @returns 0 on success, non-zero on failure
@@ -899,11 +961,13 @@ TEST (testTensorSrcIio, properties)
  * @param[in] data_value value of the data for making
  * @param[in] data_bits number of bits for the data
  * @param[in] trigger if the device should support trigger
+ * @param[in] skip skip some of the channels
+ * @param[in] exact_storage keep the storage size of the channels unrounded
  * @returns allocated device structure on success, NULL on error
  */
 static iio_dev_dir_struct *
 make_full_device (const guint64 data_value, const gint data_bits,
-    const gboolean trigger = TRUE, const gint skip = 1)
+    const gboolean trigger = TRUE, const gint skip = 1, const gboolean exact_storage = FALSE)
 {
   iio_dev_dir_struct *dev0;
   gint status = 0;
@@ -923,7 +987,11 @@ make_full_device (const guint64 data_value, const gint data_bits,
   /** dir for continuous mode */
   status += build_dev_dir_buffer (dev0);
   status += build_dev_dir_dev_data (dev0);
-  status += build_dev_dir_scan_elements (dev0, data_bits, data_value, data_value, skip);
+  if (exact_storage) {
+    status += build_dev_dir_scan_elements_exact (dev0, data_bits, data_value);
+  } else {
+    status += build_dev_dir_scan_elements (dev0, data_bits, data_value, data_value, skip);
+  }
   status += build_dev_dir_timestamp (dev0);
 
   /** dir for single-shot mode */
@@ -1699,6 +1767,431 @@ TEST (testTensorSrcIio, setBaseDir_n)
 
   status = gst_element_set_state (src_iio, GST_STATE_PAUSED);
   EXPECT_NE (status, GST_STATE_CHANGE_NO_PREROLL);
+
+  /** teardown */
+  gst_object_unref (src_iio);
+  gst_harness_teardown (hrnss);
+}
+
+/**
+ * @brief run a pipeline and verify the data of channels with an exact storage
+ * @param[in] num_bits num of bits used and stored for the data, multiple of 8
+ */
+static void
+run_data_verify_exact_storage (const guint num_bits)
+{
+  static const gint MAX_NUM_TRY = 100;
+  gint num_try;
+  iio_dev_dir_struct *dev0;
+  GstElement *src_iio_pipeline;
+  GstStateChangeReturn status;
+  GstState state;
+  gchar *parse_launch;
+  gint samp_freq;
+  gint fd, ret;
+  size_t idx, bytes_read, bytes_to_read;
+  gchar *data_buffer;
+  gfloat expect_val, actual_val;
+  guint64 expect_val_mask;
+  gchar *expect_val_char, *actual_val_char;
+  struct stat stat_buf;
+
+  /** Make device */
+  dev0 = make_full_device (DATA, num_bits, FALSE, 1, TRUE);
+  ASSERT_NE (dev0, nullptr);
+
+  /** setup */
+  samp_freq = (gint) g_ascii_strtoll (samp_freq_avail[0], NULL, 10);
+  dev0->log_file = g_build_filename (dev0->base_dir, "temp.log", NULL);
+  parse_launch = g_strdup_printf (
+      "%s iio-base-dir=%s dev-dir=%s device=%s silent=FALSE ! multifilesink location=%s",
+      ELEMENT_NAME, dev0->iio_base_dir_sim, dev0->dev_dir, DEVICE_NAME, dev0->log_file);
+  src_iio_pipeline = gst_parse_launch (parse_launch, NULL);
+  g_free (parse_launch);
+  ASSERT_NE (src_iio_pipeline, nullptr);
+
+  EXPECT_EQ (setPipelineStateSync (src_iio_pipeline, GST_STATE_PLAYING, DEFAULT_POLL_TIMEOUT), 0);
+
+  /** feed the device till multifilesink makes the needed file */
+  num_try = 0;
+  while ((fd = open (dev0->log_file, O_RDONLY)) < 0) {
+    if (num_try >= MAX_NUM_TRY) {
+      FAIL () << "Failed to open " << dev0->log_file;
+    }
+    g_usleep (MAX (10, 1000000 / samp_freq));
+    num_try++;
+  }
+  for (num_try = 0; num_try < MAX_NUM_TRY; ++num_try) {
+    g_usleep (MAX (10, 1000000 / samp_freq));
+    if (build_dev_dir_scan_elements_exact (dev0, num_bits, DATA) != 0) {
+      close (fd);
+      FAIL () << "Failed to build and fill scan elements directory";
+    }
+    ret = stat (dev0->log_file, &stat_buf);
+    if (ret == 0 && stat_buf.st_size != 0) {
+      status = gst_element_set_state (src_iio_pipeline, GST_STATE_NULL);
+      EXPECT_EQ (status, GST_STATE_CHANGE_SUCCESS);
+      status = gst_element_get_state (src_iio_pipeline, &state, NULL, GST_CLOCK_TIME_NONE);
+      EXPECT_EQ (status, GST_STATE_CHANGE_SUCCESS);
+      EXPECT_EQ (state, GST_STATE_NULL);
+      break;
+    }
+  }
+
+  /** verify correctness of data of every channel */
+  bytes_to_read = sizeof (float) * BUF_LENGTH * dev0->num_scan_elements;
+  data_buffer = (gchar *) g_malloc (bytes_to_read);
+  ret = read (fd, data_buffer, bytes_to_read);
+  close (fd);
+  ASSERT_GE (ret, 0);
+  bytes_read = static_cast<size_t> (ret);
+  EXPECT_EQ (bytes_read, bytes_to_read);
+
+  expect_val_mask = G_MAXUINT64 >> (64 - num_bits);
+  expect_val = ((DATA & expect_val_mask) + OFFSET) * SCALE;
+  expect_val_char = g_strdup_printf ("%.2f", expect_val);
+  for (idx = 0; idx < bytes_read / sizeof (float); idx++) {
+    actual_val = ((gfloat *) data_buffer)[idx];
+    actual_val_char = g_strdup_printf ("%.2f", actual_val);
+    EXPECT_STREQ (expect_val_char, actual_val_char);
+    g_free (actual_val_char);
+  }
+  g_free (expect_val_char);
+  g_free (data_buffer);
+
+  /** delete device structure */
+  ASSERT_EQ (safe_remove (dev0->log_file), 0);
+  gst_object_unref (src_iio_pipeline);
+  ASSERT_EQ (destroy_dev_dir (dev0), 0);
+  clean_iio_dev_structure (dev0);
+}
+
+/**
+ * @brief tests data of channels stored in 3 bytes
+ */
+TEST (testTensorSrcIio, dataVerifyExactStorage24)
+{
+  run_data_verify_exact_storage (24);
+}
+
+/**
+ * @brief tests data of channels stored in 7 bytes
+ */
+TEST (testTensorSrcIio, dataVerifyExactStorage56)
+{
+  run_data_verify_exact_storage (56);
+}
+
+/**
+ * @brief add scan elements of a disabled channel and run the device
+ * @param[in] names files of the extra channel, contents in the same order
+ * @param[in] contents contents of the files
+ * @param[in] num_files number of the extra files
+ * @param[in] expected state change expected when the device is configured
+ * @note the generic name of a channel is its name without the trailing digits,
+ * which is empty for the names used here
+ */
+static void
+run_extra_channel_case (const gchar *const *names, const gchar *const *contents,
+    const guint num_files, const GstStateChangeReturn expected)
+{
+  iio_dev_dir_struct *dev0;
+  GstHarness *hrnss = NULL;
+  GstElement *src_iio = NULL;
+  GstStateChangeReturn status;
+  gchar **extra_files;
+  guint idx;
+
+  /** Make device */
+  dev0 = make_full_device (DATA, 16);
+  ASSERT_NE (dev0, nullptr);
+
+  extra_files = g_new0 (gchar *, num_files);
+  for (idx = 0; idx < num_files; idx++) {
+    extra_files[idx] = g_build_filename (dev0->scan_el, names[idx], NULL);
+    ASSERT_EQ (write_file_string (extra_files[idx], contents[idx]), 0);
+  }
+
+  /** setup */
+  hrnss = gst_harness_new_empty ();
+  ASSERT_TRUE (hrnss != NULL);
+  gst_harness_add_parse (hrnss, ELEMENT_NAME);
+  src_iio = gst_harness_find_element (hrnss, ELEMENT_NAME);
+  ASSERT_TRUE (src_iio != NULL);
+
+  g_object_set (src_iio, "iio-base-dir", dev0->iio_base_dir_sim, NULL);
+  g_object_set (src_iio, "dev-dir", dev0->dev_dir, NULL);
+  g_object_set (src_iio, "device", DEVICE_NAME, NULL);
+
+  status = gst_element_set_state (src_iio, GST_STATE_PAUSED);
+  EXPECT_EQ (status, expected);
+  EXPECT_EQ (gst_element_set_state (src_iio, GST_STATE_NULL), GST_STATE_CHANGE_SUCCESS);
+
+  /** teardown */
+  gst_object_unref (src_iio);
+  gst_harness_teardown (hrnss);
+
+  for (idx = 0; idx < num_files; idx++) {
+    EXPECT_EQ (safe_remove (extra_files[idx]), 0);
+    g_free (extra_files[idx]);
+  }
+  g_free (extra_files);
+  ASSERT_EQ (destroy_dev_dir (dev0), 0);
+  clean_iio_dev_structure (dev0);
+}
+
+/**
+ * @brief tests a channel whose name holds nothing but its index
+ */
+TEST (testTensorSrcIio, channelNameDigitsOnly)
+{
+  const gchar *names[] = { "123_en", "123_index", "123_type" };
+  const gchar *contents[] = { "0", "8", "le:s16/16>>0" };
+
+  /** the extra channel is disabled, so the device is configured as usual */
+  run_extra_channel_case (names, contents, G_N_ELEMENTS (names), GST_STATE_CHANGE_NO_PREROLL);
+}
+
+/**
+ * @brief tests a channel whose name is empty
+ */
+TEST (testTensorSrcIio, channelNameEmpty_n)
+{
+  const gchar *names[] = { "_en", "_index", "_type" };
+  const gchar *contents[] = { "0", "8", "le:s16/16>>0" };
+
+  /** such a channel has no file of its own to read the state from */
+  run_extra_channel_case (names, contents, G_N_ELEMENTS (names), GST_STATE_CHANGE_FAILURE);
+}
+
+/**
+ * @brief tests the bounds of the used bits of a channel type
+ */
+TEST (testTensorSrcIio, channelTypeUsedBits)
+{
+  const gchar *names[] = { "123_en", "123_index", "123_type" };
+  const gchar *types[] = { "le:u1/8>>7", "be:s1/8>>0", "le:s64/64>>0", "be:u64/64>>0" };
+  const gchar *contents[3] = { "0", "8", NULL };
+
+  for (guint idx = 0; idx < G_N_ELEMENTS (types); idx++) {
+    contents[2] = types[idx];
+    run_extra_channel_case (names, contents, G_N_ELEMENTS (names), GST_STATE_CHANGE_NO_PREROLL);
+  }
+}
+
+/**
+ * @brief tests that a channel type with no used bits or more than 64 is refused
+ */
+TEST (testTensorSrcIio, channelTypeUsedBits_n)
+{
+  const gchar *names[] = { "123_en", "123_index", "123_type" };
+  const gchar *types[] = { "le:s0/16>>0", "be:u0/64>>0", "le:u/16>>0", "le:u1/0>>0",
+    "le:s65/64>>0", "le:u18446744073709551616/16>>0", "le:u4294967296/16>>0" };
+  const gchar *contents[3] = { "0", "8", NULL };
+
+  for (guint idx = 0; idx < G_N_ELEMENTS (types); idx++) {
+    contents[2] = types[idx];
+    run_extra_channel_case (names, contents, G_N_ELEMENTS (names), GST_STATE_CHANGE_FAILURE);
+  }
+}
+
+/**
+ * @brief tests that a buffer capacity larger than the readable size is refused
+ */
+TEST (testTensorSrcIio, bufferCapacityOverflow_n)
+{
+  iio_dev_dir_struct *dev0;
+  GstHarness *hrnss = NULL;
+  GstElement *src_iio = NULL;
+  GstStateChangeReturn status;
+
+  /** Make device, 8 channels of 2 bytes make a scan of 16 bytes */
+  dev0 = make_full_device (DATA, 16);
+  ASSERT_NE (dev0, nullptr);
+
+  /** setup */
+  hrnss = gst_harness_new_empty ();
+  ASSERT_TRUE (hrnss != NULL);
+  gst_harness_add_parse (hrnss, ELEMENT_NAME);
+  src_iio = gst_harness_find_element (hrnss, ELEMENT_NAME);
+  ASSERT_TRUE (src_iio != NULL);
+
+  g_object_set (src_iio, "iio-base-dir", dev0->iio_base_dir_sim, NULL);
+  g_object_set (src_iio, "dev-dir", dev0->dev_dir, NULL);
+  g_object_set (src_iio, "device", DEVICE_NAME, NULL);
+  /** 16 bytes per scan of this capacity do not fit in a signed int */
+  g_object_set (src_iio, "buffer-capacity", 268435457U, NULL);
+
+  status = gst_element_set_state (src_iio, GST_STATE_PAUSED);
+  EXPECT_EQ (status, GST_STATE_CHANGE_FAILURE);
+  EXPECT_EQ (gst_element_set_state (src_iio, GST_STATE_NULL), GST_STATE_CHANGE_SUCCESS);
+
+  /** teardown */
+  gst_object_unref (src_iio);
+  gst_harness_teardown (hrnss);
+
+  ASSERT_EQ (destroy_dev_dir (dev0), 0);
+  clean_iio_dev_structure (dev0);
+}
+
+/**
+ * @brief tests that the buffer capacity of a configured device does not change
+ * @note the size of a read is checked against the buffer capacity when the
+ * device is configured, which holds only while the property stays where the
+ * check left it
+ */
+TEST (testTensorSrcIio, bufferCapacityWhileConfigured_n)
+{
+  iio_dev_dir_struct *dev0;
+  GstHarness *hrnss = NULL;
+  GstElement *src_iio = NULL;
+  GstStateChangeReturn status;
+  guint ret_buffer_capacity;
+
+  /** Make device */
+  dev0 = make_full_device (DATA, 16);
+  ASSERT_NE (dev0, nullptr);
+
+  /** setup */
+  hrnss = gst_harness_new_empty ();
+  ASSERT_TRUE (hrnss != NULL);
+  gst_harness_add_parse (hrnss, ELEMENT_NAME);
+  src_iio = gst_harness_find_element (hrnss, ELEMENT_NAME);
+  ASSERT_TRUE (src_iio != NULL);
+
+  g_object_set (src_iio, "iio-base-dir", dev0->iio_base_dir_sim, NULL);
+  g_object_set (src_iio, "dev-dir", dev0->dev_dir, NULL);
+  g_object_set (src_iio, "device", DEVICE_NAME, NULL);
+  g_object_set (src_iio, "buffer-capacity", 2U, NULL);
+
+  status = gst_element_set_state (src_iio, GST_STATE_PAUSED);
+  EXPECT_EQ (status, GST_STATE_CHANGE_NO_PREROLL);
+
+  /** the buffer of the device and the caps are sized by the old value */
+  g_object_set (src_iio, "buffer-capacity", 1000U, NULL);
+  g_object_get (src_iio, "buffer-capacity", &ret_buffer_capacity, NULL);
+  EXPECT_EQ (ret_buffer_capacity, 2U);
+
+  EXPECT_EQ (gst_element_set_state (src_iio, GST_STATE_NULL), GST_STATE_CHANGE_SUCCESS);
+
+  /** the value is writable again once the device is released */
+  g_object_set (src_iio, "buffer-capacity", 1000U, NULL);
+  g_object_get (src_iio, "buffer-capacity", &ret_buffer_capacity, NULL);
+  EXPECT_EQ (ret_buffer_capacity, 1000U);
+
+  /** teardown */
+  gst_object_unref (src_iio);
+  gst_harness_teardown (hrnss);
+
+  ASSERT_EQ (destroy_dev_dir (dev0), 0);
+  clean_iio_dev_structure (dev0);
+}
+
+/**
+ * @brief counts the critical logs of glib
+ */
+static void
+count_glib_critical (const gchar *, GLogLevelFlags, const gchar *, gpointer user_data)
+{
+  guint *count = (guint *) user_data;
+
+  *count = *count + 1;
+}
+
+/**
+ * @brief tests the custom channels property
+ */
+TEST (testTensorSrcIio, channelsCustom)
+{
+  GstHarness *hrnss = NULL;
+  GstElement *src_iio = NULL;
+  gchar *ret_channels;
+  gchar **strv;
+
+  /** setup */
+  hrnss = gst_harness_new_empty ();
+  ASSERT_TRUE (hrnss != NULL);
+  gst_harness_add_parse (hrnss, ELEMENT_NAME);
+  src_iio = gst_harness_find_element (hrnss, ELEMENT_NAME);
+  ASSERT_TRUE (src_iio != NULL);
+
+  g_object_set (src_iio, "channels", "1", NULL);
+  g_object_get (src_iio, "channels", &ret_channels, NULL);
+  EXPECT_STREQ (ret_channels, "1");
+  g_free (ret_channels);
+
+  /** a new value replaces the previous one */
+  g_object_set (src_iio, "channels", "2", NULL);
+  g_object_get (src_iio, "channels", &ret_channels, NULL);
+  EXPECT_STREQ (ret_channels, "2");
+  g_free (ret_channels);
+
+  g_object_set (src_iio, "channels", "3,4;5", NULL);
+  g_object_get (src_iio, "channels", &ret_channels, NULL);
+  strv = g_strsplit (ret_channels, ",", -1);
+  EXPECT_EQ (g_strv_length (strv), 3U);
+  EXPECT_TRUE (g_strv_contains ((const gchar *const *) strv, "3"));
+  EXPECT_TRUE (g_strv_contains ((const gchar *const *) strv, "4"));
+  EXPECT_TRUE (g_strv_contains ((const gchar *const *) strv, "5"));
+  g_strfreev (strv);
+  g_free (ret_channels);
+
+  /** a duplicated index is registered once */
+  g_object_set (src_iio, "channels", "6,6", NULL);
+  g_object_get (src_iio, "channels", &ret_channels, NULL);
+  EXPECT_STREQ (ret_channels, "6");
+  g_free (ret_channels);
+
+  /** the enum values are still accepted */
+  g_object_set (src_iio, "channels", channels[1], NULL);
+  g_object_get (src_iio, "channels", &ret_channels, NULL);
+  EXPECT_STREQ (ret_channels, channels[1]);
+  g_free (ret_channels);
+
+  /** teardown */
+  gst_object_unref (src_iio);
+  gst_harness_teardown (hrnss);
+}
+
+/**
+ * @brief tests that an unparsable custom channels value keeps the old one
+ */
+TEST (testTensorSrcIio, channelsCustomInvalid_n)
+{
+  GstHarness *hrnss = NULL;
+  GstElement *src_iio = NULL;
+  gchar *ret_channels;
+  guint critical_count = 0;
+  guint log_id;
+  const gchar *invalid[] = { "abc", "-1", "2,abc", "99999999999999999999", "4294967297" };
+  guint idx;
+
+  /** setup */
+  hrnss = gst_harness_new_empty ();
+  ASSERT_TRUE (hrnss != NULL);
+  gst_harness_add_parse (hrnss, ELEMENT_NAME);
+  src_iio = gst_harness_find_element (hrnss, ELEMENT_NAME);
+  ASSERT_TRUE (src_iio != NULL);
+
+  log_id = g_log_set_handler ("GLib", G_LOG_LEVEL_CRITICAL, count_glib_critical, &critical_count);
+
+  g_object_set (src_iio, "channels", "7", NULL);
+
+  for (idx = 0; idx < G_N_ELEMENTS (invalid); idx++) {
+    g_object_set (src_iio, "channels", invalid[idx], NULL);
+    g_object_get (src_iio, "channels", &ret_channels, NULL);
+    EXPECT_STREQ (ret_channels, "7") << "with the value " << invalid[idx];
+    g_free (ret_channels);
+  }
+
+  /** a refused value does not block the next one */
+  g_object_set (src_iio, "channels", "8", NULL);
+  g_object_get (src_iio, "channels", &ret_channels, NULL);
+  EXPECT_STREQ (ret_channels, "8");
+  g_free (ret_channels);
+
+  EXPECT_EQ (critical_count, 0U);
+  g_log_remove_handler ("GLib", log_id);
 
   /** teardown */
   gst_object_unref (src_iio);

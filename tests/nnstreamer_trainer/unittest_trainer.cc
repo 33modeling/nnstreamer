@@ -10,7 +10,12 @@
 #include <gtest/gtest.h>
 #include <glib.h>
 #include <glib/gstdio.h>
+#include <gst/check/gstharness.h>
 #include <gst/gst.h>
+#include <nnstreamer_plugin_api.h>
+#include <nnstreamer_plugin_api_trainer.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <unittest_util.h>
 
 static const gchar filename[] = "mnist.data";
@@ -567,6 +572,1162 @@ TEST (tensor_trainer, invalidNumLabels0_n)
 
   gst_object_unref (GST_OBJECT (tensor_trainer));
   gst_object_unref (GST_OBJECT (pipeline));
+}
+
+/**
+ * @brief What the fake trainer sub-plugin has been asked to do.
+ */
+static struct {
+  gint stop_calls; /**< number of stop() calls, one per dummy-data thread */
+  gint push_calls; /**< number of push_data() calls entered */
+  gint push_done; /**< number of push_data() calls returned */
+  gulong first_push_delay; /**< microseconds the first push_data() sleeps */
+  gsize pushed_size; /**< size of the first input tensor last pushed */
+  guint8 pushed_first; /**< first byte of the first input tensor last pushed */
+  gchar expect_config[512]; /**< model-config every push_data() should see */
+  gboolean config_matched; /**< whether the last push_data() saw it */
+  gint push_ret; /**< what push_data() returns */
+  GstTensorTrainerEventNotifier *notifier; /**< notifier given to start() */
+  gboolean notify_on_destroy; /**< whether destroy() sends a completion event */
+  gint create_ret; /**< what create() returns */
+  gint destroy_calls; /**< number of destroy() calls */
+  gboolean destroy_prop_matched; /**< whether destroy() saw the set properties */
+  guint missing_tensors; /**< inputs and labels without data in the last push_data() */
+  gint extra_warnings; /**< warnings tensor_trainer logged about extra tensors */
+} fake_stat;
+
+/**
+ * @brief Fake sub-plugin callback that creates nothing.
+ */
+static int
+fake_trainer_create (const GstTensorTrainerFramework *,
+    const GstTensorTrainerProperties *, void **)
+{
+  return fake_stat.create_ret;
+}
+
+/**
+ * @brief Compare a property string byte by byte.
+ * @note Reading it here, not in a libc call, makes Valgrind attribute a
+ *       read of a freed property to this repository.
+ */
+static gboolean
+fake_prop_equals (const gchar *prop, const gchar *expected)
+{
+  guint i;
+
+  if (!prop)
+    return FALSE;
+
+  for (i = 0; expected[i]; i++) {
+    if (prop[i] != expected[i])
+      return FALSE;
+  }
+
+  return prop[i] == '\0';
+}
+
+/**
+ * @brief Fake sub-plugin callback checking the properties it is destroyed with.
+ * @note With notify_on_destroy, it sends the completion event a sub-plugin's
+ *       training thread sends while destroy() stops it.
+ */
+static int
+fake_trainer_destroy (const GstTensorTrainerFramework *,
+    const GstTensorTrainerProperties *prop, void **)
+{
+  g_atomic_int_inc (&fake_stat.destroy_calls);
+
+  fake_stat.destroy_prop_matched
+      = fake_prop_equals (prop->model_save_path, "c31_model.bin")
+        && fake_prop_equals (prop->model_config, fake_stat.expect_config);
+
+  if (fake_stat.notify_on_destroy && fake_stat.notifier)
+    nnstreamer_trainer_notify_event (
+        fake_stat.notifier, TRAINER_EVENT_TRAINING_COMPLETION, NULL);
+
+  return 0;
+}
+
+/**
+ * @brief Fake sub-plugin callback keeping the event notifier.
+ */
+static int
+fake_trainer_start (const GstTensorTrainerFramework *,
+    const GstTensorTrainerProperties *, GstTensorTrainerEventNotifier *notifier, void *)
+{
+  fake_stat.notifier = notifier;
+  return 0;
+}
+
+/**
+ * @brief Fake sub-plugin callback counting stop() calls.
+ */
+static int
+fake_trainer_stop (const GstTensorTrainerFramework *,
+    const GstTensorTrainerProperties *, void **)
+{
+  g_atomic_int_inc (&fake_stat.stop_calls);
+  return 0;
+}
+
+/**
+ * @brief Fake sub-plugin callback recording the pushed data.
+ */
+static int
+fake_trainer_push_data (const GstTensorTrainerFramework *,
+    const GstTensorTrainerProperties *prop, void *, const GstTensorMemory *input)
+{
+  if (g_atomic_int_add (&fake_stat.push_calls, 1) == 0 && fake_stat.first_push_delay > 0)
+    g_usleep (fake_stat.first_push_delay);
+
+  /* the properties must outlive this call, even when it runs during finalize */
+  if (prop->model_config && fake_stat.expect_config[0]) {
+    guint i;
+
+    fake_stat.config_matched = TRUE;
+    for (i = 0; fake_stat.expect_config[i]; i++) {
+      if (prop->model_config[i] != fake_stat.expect_config[i]) {
+        fake_stat.config_matched = FALSE;
+        break;
+      }
+    }
+  }
+
+  fake_stat.missing_tensors = 0;
+  for (guint i = 0; i < prop->num_inputs + prop->num_labels; i++) {
+    if (!input[i].data)
+      fake_stat.missing_tensors++;
+  }
+
+  fake_stat.pushed_size = input[0].size;
+  if (input[0].data && input[0].size > 0)
+    fake_stat.pushed_first = ((guint8 *) input[0].data)[0];
+
+  g_atomic_int_inc (&fake_stat.push_done);
+  return fake_stat.push_ret;
+}
+
+/**
+ * @brief Fake sub-plugin callback reporting a fixed status.
+ */
+static int
+fake_trainer_get_status (
+    const GstTensorTrainerFramework *, GstTensorTrainerProperties *prop, void *)
+{
+  prop->training_loss = 1.0;
+  return 0;
+}
+
+/**
+ * @brief Fake sub-plugin callback naming the framework.
+ * @note It takes the name nntrainer, the only framework tensor_trainer
+ *       starts a dummy-data thread for.
+ */
+static int
+fake_trainer_get_framework_info (const GstTensorTrainerFramework *,
+    const GstTensorTrainerProperties *, void *, GstTensorTrainerFrameworkInfo *fw_info)
+{
+  fw_info->name = "nntrainer";
+  return 0;
+}
+
+/**
+ * @brief The fake trainer sub-plugin.
+ */
+static GstTensorTrainerFramework fake_trainer_fw = { GST_TENSOR_TRAINER_FRAMEWORK_V1,
+  fake_trainer_create, fake_trainer_destroy, fake_trainer_start, fake_trainer_stop,
+  fake_trainer_push_data, fake_trainer_get_status, fake_trainer_get_framework_info };
+
+/**
+ * @brief Count the warnings tensor_trainer logs about extra tensors.
+ */
+static void
+trainer_count_extra_warning (GstDebugCategory *category, GstDebugLevel level,
+    const gchar *, const gchar *, gint, GObject *, GstDebugMessage *message, gpointer)
+{
+  const gchar *text;
+
+  if (level != GST_LEVEL_WARNING
+      || g_strcmp0 (gst_debug_category_get_name (category), "tensor_trainer") != 0)
+    return;
+
+  text = gst_debug_message_get (message);
+  if (text && strstr (text, "more than num-inputs"))
+    g_atomic_int_inc (&fake_stat.extra_warnings);
+}
+
+/**
+ * @brief Test fixture registering the fake trainer sub-plugin.
+ */
+class TensorTrainerFakeFw : public ::testing::Test
+{
+  protected:
+  /**
+   * @brief Reset the counters and register the fake sub-plugin.
+   */
+  void SetUp () override
+  {
+    static gsize log_added = 0;
+
+    /* removing a log function leaks in GStreamer, so it stays for the whole run */
+    if (g_once_init_enter (&log_added)) {
+      gst_debug_set_threshold_for_name ("tensor_trainer", GST_LEVEL_WARNING);
+      gst_debug_add_log_function (trainer_count_extra_warning, NULL, NULL);
+      g_once_init_leave (&log_added, 1);
+    }
+
+    memset (&fake_stat, 0, sizeof (fake_stat));
+    ASSERT_TRUE (nnstreamer_trainer_probe (&fake_trainer_fw));
+  }
+
+  /**
+   * @brief Unregister the fake sub-plugin.
+   */
+  void TearDown () override
+  {
+    nnstreamer_trainer_exit (&fake_trainer_fw);
+  }
+};
+
+/**
+ * @brief Create a tensor_trainer that uses the fake sub-plugin.
+ */
+static GstElement *
+make_fake_trainer (void)
+{
+  gchar *config_path = get_file_path (model_config);
+  GstElement *trainer = gst_element_factory_make ("tensor_trainer", NULL);
+
+  if (trainer)
+    g_object_set (trainer, "framework", "nntrainer", "model-config",
+        config_path, "model-save-path", "c31_model.bin", NULL);
+  g_free (config_path);
+
+  return trainer;
+}
+
+/**
+ * @brief Wait until the fake sub-plugin has seen @a count stop() calls.
+ */
+static gboolean
+wait_for_stop_calls (gint count)
+{
+  guint i;
+
+  for (i = 0; i < 500; i++) {
+    if (g_atomic_int_get (&fake_stat.stop_calls) >= count)
+      return TRUE;
+    g_usleep (10000);
+  }
+
+  return FALSE;
+}
+
+/**
+ * @brief Pausing twice waits for the first dummy-data thread.
+ *
+ * The first thread is still inside push_data() when the element pauses
+ * again. The element must join it before starting the second one; if the
+ * handle is overwritten instead, finalize joins only the second thread and
+ * the first one outlives the element.
+ */
+TEST_F (TensorTrainerFakeFw, pauseTwiceJoinsDummyThread)
+{
+  GstElement *trainer = make_fake_trainer ();
+  ASSERT_NE (trainer, nullptr);
+
+  fake_stat.first_push_delay = G_USEC_PER_SEC;
+
+  EXPECT_EQ (gst_element_set_state (trainer, GST_STATE_PLAYING), GST_STATE_CHANGE_SUCCESS);
+  EXPECT_EQ (gst_element_set_state (trainer, GST_STATE_PAUSED), GST_STATE_CHANGE_SUCCESS);
+  ASSERT_TRUE (wait_for_stop_calls (1));
+
+  EXPECT_EQ (gst_element_set_state (trainer, GST_STATE_PLAYING), GST_STATE_CHANGE_SUCCESS);
+  EXPECT_EQ (gst_element_set_state (trainer, GST_STATE_PAUSED), GST_STATE_CHANGE_SUCCESS);
+  EXPECT_EQ (gst_element_set_state (trainer, GST_STATE_NULL), GST_STATE_CHANGE_SUCCESS);
+  gst_object_unref (trainer);
+
+  EXPECT_EQ (g_atomic_int_get (&fake_stat.stop_calls), 2);
+  EXPECT_EQ (g_atomic_int_get (&fake_stat.push_done), 2);
+}
+
+/**
+ * @brief Finalizing the element waits for a running dummy-data thread.
+ *
+ * The thread is inside push_data() while the element is finalized, and it
+ * reads the properties there. Finalize must therefore join it before it
+ * frees them; if the join stays below the frees, the sub-plugin reads
+ * freed memory, which the Valgrind job reports as an error of ours.
+ */
+TEST_F (TensorTrainerFakeFw, finalizeJoinsDummyThread)
+{
+  GstElement *trainer = make_fake_trainer ();
+  gchar *config_path = get_file_path (model_config);
+
+  ASSERT_NE (trainer, nullptr);
+  ASSERT_LT (strlen (config_path), sizeof (fake_stat.expect_config));
+
+  fake_stat.first_push_delay = G_USEC_PER_SEC / 2;
+  g_strlcpy (fake_stat.expect_config, config_path, sizeof (fake_stat.expect_config));
+
+  EXPECT_EQ (gst_element_set_state (trainer, GST_STATE_PLAYING), GST_STATE_CHANGE_SUCCESS);
+  EXPECT_EQ (gst_element_set_state (trainer, GST_STATE_PAUSED), GST_STATE_CHANGE_SUCCESS);
+  ASSERT_TRUE (wait_for_stop_calls (1));
+
+  EXPECT_EQ (gst_element_set_state (trainer, GST_STATE_NULL), GST_STATE_CHANGE_SUCCESS);
+  gst_object_unref (trainer);
+
+  EXPECT_EQ (g_atomic_int_get (&fake_stat.stop_calls), 1);
+  EXPECT_EQ (g_atomic_int_get (&fake_stat.push_done), 1);
+  EXPECT_TRUE (fake_stat.config_matched);
+
+  g_free (config_path);
+}
+
+/**
+ * @brief Finalizing the element destroys the sub-plugin before releasing its resources.
+ *
+ * destroy() receives the trainer properties, and the sub-plugin's training
+ * thread, which destroy() stops, may still notify the element. Finalize must
+ * call destroy() before it frees the property strings and clears the
+ * completion mutex and cond; otherwise destroy() reads freed strings, which
+ * the comparison below and the Valgrind job report.
+ */
+TEST_F (TensorTrainerFakeFw, finalizeDestroysBeforeFree)
+{
+  GstElement *trainer = make_fake_trainer ();
+  gchar *config_path = get_file_path (model_config);
+
+  ASSERT_NE (trainer, nullptr);
+  ASSERT_LT (strlen (config_path), sizeof (fake_stat.expect_config));
+
+  g_strlcpy (fake_stat.expect_config, config_path, sizeof (fake_stat.expect_config));
+  fake_stat.notify_on_destroy = TRUE;
+
+  EXPECT_EQ (gst_element_set_state (trainer, GST_STATE_PLAYING), GST_STATE_CHANGE_SUCCESS);
+  EXPECT_NE (fake_stat.notifier, nullptr);
+  EXPECT_EQ (gst_element_set_state (trainer, GST_STATE_NULL), GST_STATE_CHANGE_SUCCESS);
+  EXPECT_EQ (g_atomic_int_get (&fake_stat.destroy_calls), 0);
+
+  gst_object_unref (trainer);
+
+  EXPECT_EQ (g_atomic_int_get (&fake_stat.destroy_calls), 1);
+  EXPECT_TRUE (fake_stat.destroy_prop_matched);
+
+  g_free (config_path);
+}
+
+/**
+ * @brief Finalizing an element whose model creation failed does not destroy it.
+ */
+TEST_F (TensorTrainerFakeFw, finalizeAfterCreateFailure_n)
+{
+  GstElement *trainer = make_fake_trainer ();
+  ASSERT_NE (trainer, nullptr);
+
+  fake_stat.create_ret = -1;
+
+  EXPECT_EQ (gst_element_set_state (trainer, GST_STATE_PLAYING), GST_STATE_CHANGE_FAILURE);
+  EXPECT_EQ (gst_element_set_state (trainer, GST_STATE_NULL), GST_STATE_CHANGE_SUCCESS);
+  gst_object_unref (trainer);
+
+  EXPECT_EQ (g_atomic_int_get (&fake_stat.destroy_calls), 0);
+  EXPECT_EQ (fake_stat.notifier, nullptr);
+}
+
+/**
+ * @brief Create a harness around a playing tensor_trainer with the fake sub-plugin.
+ */
+static GstHarness *
+make_fake_trainer_harness (void)
+{
+  GstHarness *h;
+  GstElement *trainer = make_fake_trainer ();
+
+  if (!trainer)
+    return NULL;
+
+  h = gst_harness_new_with_element (trainer, "sink", "src");
+  gst_object_unref (trainer);
+
+  return h;
+}
+
+/**
+ * @brief Build static caps with @a num uint8 tensors of one element each.
+ */
+static gchar *
+make_static_caps_string (guint num, gint rate_n)
+{
+  GString *caps = g_string_new (NULL);
+  guint i;
+
+  g_string_append_printf (caps,
+      "other/tensors,format=static,num_tensors=%u,framerate=%d/1,dimensions=(string)\"",
+      num, rate_n);
+  for (i = 0; i < num; i++)
+    g_string_append (caps, i == 0 ? "1:1:1:1" : ".1:1:1:1");
+  g_string_append (caps, "\",types=(string)\"");
+  for (i = 0; i < num; i++)
+    g_string_append (caps, i == 0 ? "uint8" : ",uint8");
+  g_string_append (caps, "\"");
+
+  return g_string_free (caps, FALSE);
+}
+
+/**
+ * @brief Append a flexible uint8 tensor holding a copy of @a data to @a buf.
+ */
+static gboolean
+append_flexible_tensor (GstBuffer *buf, const guint8 *data, gsize size)
+{
+  GstTensorMetaInfo meta;
+  GstMemory *data_mem, *mem;
+
+  gst_tensor_meta_info_init (&meta);
+  meta.type = _NNS_UINT8;
+  meta.dimension[0] = (guint) size;
+  meta.format = _NNS_TENSOR_FORMAT_FLEXIBLE;
+
+  data_mem = gst_memory_new_wrapped (
+      GST_MEMORY_FLAG_READONLY, (gpointer) data, size, 0, size, NULL, NULL);
+  mem = gst_tensor_meta_info_append_header (&meta, data_mem);
+  gst_memory_unref (data_mem);
+  if (!mem)
+    return FALSE;
+
+  gst_buffer_append_memory (buf, mem);
+  return TRUE;
+}
+
+/**
+ * @brief Renegotiating caps with more than 16 tensors frees the previous config.
+ *
+ * Each GstTensorsInfo with more than 16 tensors owns a heap block for the
+ * extra tensors. The copy in the trainer properties, the negotiated input
+ * config and the last copy at finalize must all be released; the leak
+ * gate of the valgrind CI job is what fails if one is dropped.
+ */
+TEST_F (TensorTrainerFakeFw, renegotiateManyTensors)
+{
+  GstHarness *h = make_fake_trainer_harness ();
+  GstCaps *caps;
+  GstStructure *s;
+  gchar *caps_str;
+  gint rate_n = 0, rate_d = 0;
+
+  ASSERT_NE (h, nullptr);
+
+  caps_str = make_static_caps_string (17, 10);
+  gst_harness_set_src_caps_str (h, caps_str);
+  g_free (caps_str);
+
+  caps_str = make_static_caps_string (18, 30);
+  gst_harness_set_src_caps_str (h, caps_str);
+  g_free (caps_str);
+
+  caps = gst_pad_get_current_caps (GST_PAD_PEER (h->sinkpad));
+  ASSERT_NE (caps, nullptr);
+  s = gst_caps_get_structure (caps, 0);
+  EXPECT_TRUE (gst_structure_get_fraction (s, "framerate", &rate_n, &rate_d));
+  EXPECT_EQ (rate_n, 30);
+  EXPECT_EQ (rate_d, 1);
+  gst_caps_unref (caps);
+
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Push a flexible input of 4 bytes and a flexible label with valid headers.
+ */
+TEST_F (TensorTrainerFakeFw, flexibleInput)
+{
+  GstHarness *h = make_fake_trainer_harness ();
+  GstBuffer *buf;
+  const guint8 data[4] = { 7, 8, 9, 10 };
+  const guint8 label = 1;
+
+  ASSERT_NE (h, nullptr);
+  gst_harness_set_src_caps_str (h, "other/tensors,format=flexible,framerate=0/1");
+
+  buf = gst_buffer_new ();
+  ASSERT_TRUE (append_flexible_tensor (buf, data, sizeof (data)));
+  ASSERT_TRUE (append_flexible_tensor (buf, &label, sizeof (label)));
+
+  EXPECT_EQ (gst_harness_push (h, buf), GST_FLOW_OK);
+  EXPECT_EQ (g_atomic_int_get (&fake_stat.push_done), 1);
+  EXPECT_EQ (fake_stat.pushed_size, sizeof (data));
+  EXPECT_EQ ((guint) fake_stat.pushed_first, 7U);
+  EXPECT_EQ (fake_stat.missing_tensors, 0U);
+  EXPECT_EQ (gst_harness_buffers_received (h), 1U);
+
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Push a flexible tensor whose memory is shorter than the tensor header.
+ *
+ * The 8 bytes end right before an inaccessible page, so reading the
+ * 128-byte header out of them faults instead of silently reading the
+ * neighbouring heap. A valid label follows, so the tensor count is not
+ * what the element refuses.
+ */
+TEST_F (TensorTrainerFakeFw, flexibleHeaderTruncated_n)
+{
+  const gsize page = (gsize) sysconf (_SC_PAGESIZE);
+  const gsize size = 8;
+  const guint8 label = 1;
+  GstHarness *h;
+  GstBuffer *buf;
+  gpointer region;
+
+  region = mmap (NULL, page * 2, PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  ASSERT_NE (region, MAP_FAILED);
+  memset (region, 0, page);
+  if (mprotect ((guint8 *) region + page, page, PROT_NONE) != 0) {
+    munmap (region, page * 2);
+    FAIL () << "Cannot protect the guard page.";
+  }
+
+  h = make_fake_trainer_harness ();
+  if (!h) {
+    munmap (region, page * 2);
+    FAIL () << "Cannot create the harness.";
+  }
+  gst_harness_set_src_caps_str (h, "other/tensors,format=flexible,framerate=0/1");
+
+  buf = gst_buffer_new ();
+  gst_buffer_append_memory (buf, gst_memory_new_wrapped (GST_MEMORY_FLAG_READONLY,
+                                     region, page, page - size, size, NULL, NULL));
+  EXPECT_TRUE (append_flexible_tensor (buf, &label, sizeof (label)));
+
+  EXPECT_EQ (gst_harness_push (h, buf), GST_FLOW_ERROR);
+  EXPECT_EQ (g_atomic_int_get (&fake_stat.push_calls), 0);
+  EXPECT_EQ (gst_harness_buffers_received (h), 0U);
+
+  gst_harness_teardown (h);
+  munmap (region, page * 2);
+}
+
+/**
+ * @brief Push a flexible tensor whose header is long enough but invalid, and a valid label.
+ */
+TEST_F (TensorTrainerFakeFw, flexibleHeaderInvalid_n)
+{
+  GstHarness *h = make_fake_trainer_harness ();
+  GstBuffer *buf;
+  const guint8 label = 1;
+
+  ASSERT_NE (h, nullptr);
+  gst_harness_set_src_caps_str (h, "other/tensors,format=flexible,framerate=0/1");
+
+  buf = gst_buffer_new_allocate (NULL, 256, NULL);
+  gst_buffer_memset (buf, 0, 0, 256);
+  ASSERT_TRUE (append_flexible_tensor (buf, &label, sizeof (label)));
+
+  EXPECT_EQ (gst_harness_push (h, buf), GST_FLOW_ERROR);
+  EXPECT_EQ (g_atomic_int_get (&fake_stat.push_calls), 0);
+
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Push a flexible tensor whose header has a version the build cannot size.
+ *
+ * The header passes validation but its size is unknown. The declared data
+ * size equals the whole memory, so only refusing the header keeps the
+ * header bytes from reaching the sub-plugin as data. A valid label follows.
+ */
+TEST_F (TensorTrainerFakeFw, flexibleHeaderUnknownVersion_n)
+{
+  GstHarness *h = make_fake_trainer_harness ();
+  GstTensorMetaInfo meta;
+  GstBuffer *buf;
+  GstMapInfo map;
+  const guint8 label = 1;
+
+  ASSERT_NE (h, nullptr);
+  gst_harness_set_src_caps_str (h, "other/tensors,format=flexible,framerate=0/1");
+
+  gst_tensor_meta_info_init (&meta);
+  meta.type = _NNS_UINT8;
+  meta.dimension[0] = 256;
+  meta.format = _NNS_TENSOR_FORMAT_FLEXIBLE;
+
+  buf = gst_buffer_new_allocate (NULL, 256, NULL);
+  gst_buffer_memset (buf, 0, 0, 256);
+  ASSERT_TRUE (gst_buffer_map (buf, &map, GST_MAP_WRITE));
+  EXPECT_TRUE (gst_tensor_meta_info_update_header (&meta, map.data));
+  ((uint32_t *) map.data)[1] = 0xDE002000U;
+  gst_buffer_unmap (buf, &map);
+  ASSERT_TRUE (append_flexible_tensor (buf, &label, sizeof (label)));
+
+  EXPECT_EQ (gst_harness_push (h, buf), GST_FLOW_ERROR);
+  EXPECT_EQ (g_atomic_int_get (&fake_stat.push_calls), 0);
+
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Memory of the allocator below.
+ */
+typedef struct {
+  GstMemory mem;
+  guint8 data[8];
+} TrainerMapTestMemory;
+
+/**
+ * @brief Allocator counting its maps and unmaps, which can refuse to map.
+ */
+typedef struct {
+  GstAllocator parent;
+  gboolean refuse_map; /**< refuse every map */
+  guint maps; /**< number of maps granted */
+  guint unmaps; /**< number of unmaps */
+  guint freed; /**< number of memories freed */
+} TrainerMapTestAllocator;
+
+/**
+ * @brief Class of TrainerMapTestAllocator.
+ */
+typedef struct {
+  GstAllocatorClass parent_class;
+} TrainerMapTestAllocatorClass;
+
+G_DEFINE_TYPE (TrainerMapTestAllocator, trainer_map_test_allocator, GST_TYPE_ALLOCATOR);
+
+/**
+ * @brief Map a memory of TrainerMapTestAllocator unless it refuses to.
+ */
+static gpointer
+trainer_map_test_memory_map (GstMemory *mem, gsize, GstMapFlags)
+{
+  TrainerMapTestAllocator *self = (TrainerMapTestAllocator *) mem->allocator;
+
+  if (self->refuse_map)
+    return NULL;
+
+  self->maps++;
+  return ((TrainerMapTestMemory *) mem)->data;
+}
+
+/**
+ * @brief Unmap a memory of TrainerMapTestAllocator.
+ */
+static void
+trainer_map_test_memory_unmap (GstMemory *mem)
+{
+  ((TrainerMapTestAllocator *) mem->allocator)->unmaps++;
+}
+
+/**
+ * @brief Free a memory of TrainerMapTestAllocator.
+ */
+static void
+trainer_map_test_allocator_free (GstAllocator *allocator, GstMemory *mem)
+{
+  ((TrainerMapTestAllocator *) allocator)->freed++;
+  g_free (mem);
+}
+
+/**
+ * @brief Initialize the class of TrainerMapTestAllocator.
+ */
+static void
+trainer_map_test_allocator_class_init (TrainerMapTestAllocatorClass *klass)
+{
+  GST_ALLOCATOR_CLASS (klass)->free = trainer_map_test_allocator_free;
+}
+
+/**
+ * @brief Initialize a TrainerMapTestAllocator.
+ */
+static void
+trainer_map_test_allocator_init (TrainerMapTestAllocator *self)
+{
+  GstAllocator *allocator = GST_ALLOCATOR_CAST (self);
+
+  allocator->mem_type = "TrainerMapTest";
+  allocator->mem_map = trainer_map_test_memory_map;
+  allocator->mem_unmap = trainer_map_test_memory_unmap;
+  GST_OBJECT_FLAG_SET (allocator, GST_ALLOCATOR_FLAG_CUSTOM_ALLOC);
+}
+
+/**
+ * @brief Create a TrainerMapTestAllocator.
+ */
+static TrainerMapTestAllocator *
+trainer_map_test_allocator_new (gboolean refuse_map)
+{
+  TrainerMapTestAllocator *self = (TrainerMapTestAllocator *) g_object_new (
+      trainer_map_test_allocator_get_type (), NULL);
+
+  self->refuse_map = refuse_map;
+  return self;
+}
+
+/**
+ * @brief Append a memory of @a allocator, @a size bytes of @a value, to @a buf.
+ */
+static void
+trainer_map_test_append_memory (
+    GstBuffer *buf, TrainerMapTestAllocator *allocator, gsize size, guint8 value)
+{
+  TrainerMapTestMemory *mem = g_new0 (TrainerMapTestMemory, 1);
+
+  gst_memory_init (GST_MEMORY_CAST (mem), GST_MEMORY_FLAG_NO_SHARE,
+      GST_ALLOCATOR_CAST (allocator), NULL, sizeof (mem->data), 0, 0, size);
+  memset (mem->data, value, size);
+  gst_buffer_append_memory (buf, GST_MEMORY_CAST (mem));
+}
+
+/**
+ * @brief Count the critical messages of GStreamer.
+ */
+static void
+trainer_count_critical_log (const gchar *, GLogLevelFlags, const gchar *, gpointer user_data)
+{
+  (*(guint *) user_data)++;
+}
+
+/**
+ * @brief What one push of the two tensors below did.
+ */
+typedef struct {
+  GstFlowReturn ret; /**< flow return of the push */
+  gint push_calls; /**< push_data() calls the buffer caused */
+  gsize pushed_size; /**< size of the first tensor the sub-plugin saw */
+  guint8 pushed_first; /**< its first byte */
+  guint num_critical; /**< critical messages GStreamer logged during the push */
+  TrainerMapTestAllocator *first; /**< allocator of the first tensor */
+  TrainerMapTestAllocator *second; /**< allocator of the second tensor */
+} TrainerMapTestResult;
+
+/**
+ * @brief Push @a num_mems tensors of @a mem_size bytes, each of which may refuse to map.
+ *
+ * The caps always announce two tensors of 4 bytes, so a different count or
+ * size is what the element refuses. The counters are read before the harness
+ * is torn down, because the dummy-data thread the element starts when it
+ * pauses pushes as well. Both allocators outlive the harness and are unreffed
+ * by the caller, even the second one that a single-memory push leaves unused.
+ */
+static void
+trainer_map_test_push (guint num_mems, gsize mem_size, gboolean refuse_first,
+    gboolean refuse_second, TrainerMapTestResult *result)
+{
+  GstHarness *h = make_fake_trainer_harness ();
+  GstBuffer *buf;
+  guint handler;
+
+  memset (result, 0, sizeof (*result));
+  result->first = trainer_map_test_allocator_new (refuse_first);
+  result->second = trainer_map_test_allocator_new (refuse_second);
+  ASSERT_NE (h, nullptr);
+
+  gst_harness_set_src_caps_str (h,
+      "other/tensors,format=static,num_tensors=2,framerate=0/1,"
+      "dimensions=(string)\"4:1:1:1.4:1:1:1\",types=(string)\"uint8,uint8\"");
+
+  buf = gst_buffer_new ();
+  trainer_map_test_append_memory (buf, result->first, mem_size, 7);
+  if (num_mems > 1)
+    trainer_map_test_append_memory (buf, result->second, mem_size, 8);
+
+  handler = g_log_set_handler ("GStreamer", G_LOG_LEVEL_CRITICAL,
+      trainer_count_critical_log, &result->num_critical);
+  result->ret = gst_harness_push (h, buf);
+  g_log_remove_handler ("GStreamer", handler);
+
+  result->push_calls = g_atomic_int_get (&fake_stat.push_calls);
+  result->pushed_size = fake_stat.pushed_size;
+  result->pushed_first = fake_stat.pushed_first;
+
+  /* the dummy-data thread below repeats push_data () until it succeeds */
+  fake_stat.push_ret = 0;
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Release the allocators of a push.
+ */
+static void
+trainer_map_test_result_clear (TrainerMapTestResult *result)
+{
+  gst_object_unref (result->first);
+  gst_object_unref (result->second);
+}
+
+/**
+ * @brief Push tensors of a custom allocator; each is mapped once and unmapped once.
+ */
+TEST_F (TensorTrainerFakeFw, customAllocatorInput)
+{
+  TrainerMapTestResult result;
+
+  trainer_map_test_push (2, 4, FALSE, FALSE, &result);
+  EXPECT_EQ (result.ret, GST_FLOW_OK);
+  EXPECT_EQ (result.push_calls, 1);
+  EXPECT_EQ (result.pushed_size, 4U);
+  EXPECT_EQ ((guint) result.pushed_first, 7U);
+  EXPECT_EQ (result.num_critical, 0U);
+  EXPECT_EQ (result.first->maps, 1U);
+  EXPECT_EQ (result.first->unmaps, 1U);
+  EXPECT_EQ (result.first->freed, 1U);
+  EXPECT_EQ (result.second->maps, 1U);
+  EXPECT_EQ (result.second->unmaps, 1U);
+  EXPECT_EQ (result.second->freed, 1U);
+
+  trainer_map_test_result_clear (&result);
+}
+
+/**
+ * @brief Push a tensor that cannot be mapped.
+ *
+ * The element must not unmap the memory it could not map: GStreamer refuses
+ * an unmap whose map info does not belong to the memory with a critical
+ * message, and hands it to the allocator when the stack happens to hold the
+ * memory itself.
+ */
+TEST_F (TensorTrainerFakeFw, unmappableInput_n)
+{
+  TrainerMapTestResult result;
+
+  trainer_map_test_push (2, 4, TRUE, FALSE, &result);
+  EXPECT_EQ (result.ret, GST_FLOW_ERROR);
+  EXPECT_EQ (result.push_calls, 0);
+  EXPECT_EQ (result.num_critical, 0U);
+  EXPECT_EQ (result.first->maps, 0U);
+  EXPECT_EQ (result.first->unmaps, 0U);
+  EXPECT_EQ (result.first->freed, 1U);
+  EXPECT_EQ (result.second->maps, 0U);
+  EXPECT_EQ (result.second->unmaps, 0U);
+  EXPECT_EQ (result.second->freed, 1U);
+
+  trainer_map_test_result_clear (&result);
+}
+
+/**
+ * @brief Push two tensors, the second of which cannot be mapped.
+ *
+ * The first tensor is mapped by then and must still be unmapped, while the
+ * second one must not be.
+ */
+TEST_F (TensorTrainerFakeFw, unmappableSecondInput_n)
+{
+  TrainerMapTestResult result;
+
+  trainer_map_test_push (2, 4, FALSE, TRUE, &result);
+  EXPECT_EQ (result.ret, GST_FLOW_ERROR);
+  EXPECT_EQ (result.push_calls, 0);
+  EXPECT_EQ (result.num_critical, 0U);
+  EXPECT_EQ (result.first->maps, 1U);
+  EXPECT_EQ (result.first->unmaps, 1U);
+  EXPECT_EQ (result.first->freed, 1U);
+  EXPECT_EQ (result.second->maps, 0U);
+  EXPECT_EQ (result.second->unmaps, 0U);
+  EXPECT_EQ (result.second->freed, 1U);
+
+  trainer_map_test_result_clear (&result);
+}
+
+/**
+ * @brief Push fewer memories than the caps announce; nothing is mapped.
+ *
+ * One memory is also fewer than num-inputs + num-labels, so the element
+ * refuses the buffer before it takes any memory.
+ */
+TEST_F (TensorTrainerFakeFw, fewerMemoriesThanTensors_n)
+{
+  TrainerMapTestResult result;
+
+  trainer_map_test_push (1, 4, FALSE, FALSE, &result);
+  EXPECT_EQ (result.ret, GST_FLOW_ERROR);
+  EXPECT_EQ (result.push_calls, 0);
+  EXPECT_EQ (result.num_critical, 0U);
+  EXPECT_EQ (result.first->maps, 0U);
+  EXPECT_EQ (result.first->unmaps, 0U);
+  EXPECT_EQ (result.first->freed, 1U);
+
+  trainer_map_test_result_clear (&result);
+}
+
+/**
+ * @brief Push memories larger than the caps announce; what was mapped is unmapped.
+ */
+TEST_F (TensorTrainerFakeFw, tensorSizeMismatch_n)
+{
+  TrainerMapTestResult result;
+
+  trainer_map_test_push (2, 8, FALSE, FALSE, &result);
+  EXPECT_EQ (result.ret, GST_FLOW_ERROR);
+  EXPECT_EQ (result.push_calls, 0);
+  EXPECT_EQ (result.num_critical, 0U);
+  EXPECT_EQ (result.first->maps, 1U);
+  EXPECT_EQ (result.first->unmaps, 1U);
+  EXPECT_EQ (result.first->freed, 1U);
+  EXPECT_EQ (result.second->maps, 0U);
+  EXPECT_EQ (result.second->unmaps, 0U);
+  EXPECT_EQ (result.second->freed, 1U);
+
+  trainer_map_test_result_clear (&result);
+}
+
+/**
+ * @brief A sub-plugin that refuses the data still gets every memory released.
+ */
+TEST_F (TensorTrainerFakeFw, subpluginPushFailure_n)
+{
+  TrainerMapTestResult result;
+
+  fake_stat.push_ret = -1;
+  trainer_map_test_push (2, 4, FALSE, FALSE, &result);
+  EXPECT_EQ (result.ret, GST_FLOW_ERROR);
+  EXPECT_EQ (result.push_calls, 1);
+  EXPECT_EQ (result.num_critical, 0U);
+  EXPECT_EQ (result.first->maps, 1U);
+  EXPECT_EQ (result.first->unmaps, 1U);
+  EXPECT_EQ (result.first->freed, 1U);
+  EXPECT_EQ (result.second->maps, 1U);
+  EXPECT_EQ (result.second->unmaps, 1U);
+  EXPECT_EQ (result.second->freed, 1U);
+
+  trainer_map_test_result_clear (&result);
+}
+
+/**
+ * @brief What the pushes of the tensor count cases below did.
+ */
+typedef struct {
+  GstFlowReturn ret; /**< flow return of the last push */
+  gint push_calls; /**< push_data() calls the buffers caused */
+  guint missing_tensors; /**< inputs and labels the sub-plugin got without data */
+  gint extra_warnings; /**< warnings about extra tensors */
+} TrainerCountResult;
+
+/**
+ * @brief Set static caps of @a caps_tensors one-byte tensors, or flexible caps when it is 0.
+ */
+static void
+trainer_count_set_caps (GstHarness *h, guint caps_tensors)
+{
+  if (caps_tensors > 0) {
+    gchar *caps_str = make_static_caps_string (caps_tensors, 0);
+
+    gst_harness_set_src_caps_str (h, caps_str);
+    g_free (caps_str);
+  } else {
+    gst_harness_set_src_caps_str (h, "other/tensors,format=flexible,framerate=0/1");
+  }
+}
+
+/**
+ * @brief Push a buffer of @a num_tensors one-byte tensors, flexible when @a flexible is set.
+ */
+static GstFlowReturn
+trainer_count_push_buffer (GstHarness *h, guint num_tensors, gboolean flexible)
+{
+  GstBuffer *buf = gst_buffer_new ();
+  guint i;
+
+  for (i = 0; i < num_tensors; i++) {
+    const guint8 value = (guint8) (i + 1);
+
+    if (flexible) {
+      EXPECT_TRUE (append_flexible_tensor (buf, &value, 1));
+    } else {
+      gst_buffer_append_memory (buf, gst_allocator_alloc (NULL, 1, NULL));
+      gst_buffer_memset (buf, i, value, 1);
+    }
+  }
+
+  return gst_harness_push (h, buf);
+}
+
+/**
+ * @brief Push @a num_buffers buffers of @a num_tensors tensors to a trainer with the given num-inputs and num-labels.
+ *
+ * Static caps announce @a caps_tensors tensors, and flexible caps are used
+ * when it is 0. The counters are read before the harness is torn down,
+ * because the dummy-data thread the element starts when it pauses pushes
+ * as well.
+ */
+static void
+trainer_count_push (guint num_inputs, guint num_labels, guint caps_tensors,
+    guint num_tensors, guint num_buffers, TrainerCountResult *result)
+{
+  GstElement *trainer = make_fake_trainer ();
+  GstHarness *h;
+  guint i;
+
+  memset (result, 0, sizeof (*result));
+  result->ret = GST_FLOW_CUSTOM_ERROR;
+  ASSERT_NE (trainer, nullptr);
+
+  g_object_set (trainer, "num-inputs", num_inputs, "num-labels", num_labels, NULL);
+  h = gst_harness_new_with_element (trainer, "sink", "src");
+  gst_object_unref (trainer);
+  ASSERT_NE (h, nullptr);
+
+  trainer_count_set_caps (h, caps_tensors);
+  for (i = 0; i < num_buffers; i++)
+    result->ret = trainer_count_push_buffer (h, num_tensors, caps_tensors == 0);
+
+  result->push_calls = g_atomic_int_get (&fake_stat.push_calls);
+  result->missing_tensors = fake_stat.missing_tensors;
+  result->extra_warnings = g_atomic_int_get (&fake_stat.extra_warnings);
+
+  gst_harness_teardown (h);
+}
+
+/**
+ * @brief Push buffers of exactly num-inputs + num-labels static tensors; nothing is warned.
+ */
+TEST_F (TensorTrainerFakeFw, tensorCountMatchesInputsAndLabels)
+{
+  TrainerCountResult result;
+
+  trainer_count_push (2, 1, 3, 3, 2, &result);
+  EXPECT_EQ (result.ret, GST_FLOW_OK);
+  EXPECT_EQ (result.push_calls, 2);
+  EXPECT_EQ (result.missing_tensors, 0U);
+  EXPECT_EQ (result.extra_warnings, 0);
+}
+
+/**
+ * @brief Push buffers of exactly num-inputs + num-labels flexible tensors; nothing is warned.
+ */
+TEST_F (TensorTrainerFakeFw, flexibleTensorCountMatchesInputsAndLabels)
+{
+  TrainerCountResult result;
+
+  trainer_count_push (2, 1, 0, 3, 2, &result);
+  EXPECT_EQ (result.ret, GST_FLOW_OK);
+  EXPECT_EQ (result.push_calls, 2);
+  EXPECT_EQ (result.missing_tensors, 0U);
+  EXPECT_EQ (result.extra_warnings, 0);
+}
+
+/**
+ * @brief Push buffers with more tensors than num-inputs + num-labels.
+ *
+ * They are still accepted, and the extra tensors are warned about once,
+ * not once per buffer.
+ */
+TEST_F (TensorTrainerFakeFw, moreTensorsThanInputsAndLabels)
+{
+  TrainerCountResult result;
+
+  trainer_count_push (1, 1, 3, 3, 3, &result);
+  EXPECT_EQ (result.ret, GST_FLOW_OK);
+  EXPECT_EQ (result.push_calls, 3);
+  EXPECT_EQ (result.missing_tensors, 0U);
+  EXPECT_EQ (result.extra_warnings, 1);
+}
+
+/**
+ * @brief Push flexible buffers with more tensors than num-inputs + num-labels.
+ */
+TEST_F (TensorTrainerFakeFw, flexibleMoreTensorsThanInputsAndLabels)
+{
+  TrainerCountResult result;
+
+  trainer_count_push (1, 1, 0, 3, 3, &result);
+  EXPECT_EQ (result.ret, GST_FLOW_OK);
+  EXPECT_EQ (result.push_calls, 3);
+  EXPECT_EQ (result.missing_tensors, 0U);
+  EXPECT_EQ (result.extra_warnings, 1);
+}
+
+/**
+ * @brief The extra tensors are warned about again when the element runs again.
+ *
+ * The same element is started twice, so the second run must report them
+ * once more, and again only once.
+ */
+TEST_F (TensorTrainerFakeFw, moreTensorsWarnedOncePerRun)
+{
+  GstElement *trainer = make_fake_trainer ();
+  GstHarness *h;
+  guint run;
+
+  ASSERT_NE (trainer, nullptr);
+
+  for (run = 1; run <= 2; run++) {
+    h = gst_harness_new_with_element (trainer, "sink", "src");
+    ASSERT_NE (h, nullptr);
+
+    trainer_count_set_caps (h, 3);
+    EXPECT_EQ (trainer_count_push_buffer (h, 3, FALSE), GST_FLOW_OK);
+    EXPECT_EQ (trainer_count_push_buffer (h, 3, FALSE), GST_FLOW_OK);
+    EXPECT_EQ (g_atomic_int_get (&fake_stat.extra_warnings), (gint) run);
+
+    gst_harness_teardown (h);
+  }
+
+  gst_object_unref (trainer);
+}
+
+/**
+ * @brief Push one static tensor to a trainer that expects an input and a label.
+ *
+ * The caps agree with the buffer, so only the check against num-inputs +
+ * num-labels keeps the sub-plugin from reading a label with no data.
+ */
+TEST_F (TensorTrainerFakeFw, fewerTensorsThanInputsAndLabels_n)
+{
+  TrainerCountResult result;
+
+  trainer_count_push (1, 1, 1, 1, 1, &result);
+  EXPECT_EQ (result.ret, GST_FLOW_ERROR);
+  EXPECT_EQ (result.push_calls, 0);
+  EXPECT_EQ (result.missing_tensors, 0U);
+  EXPECT_EQ (result.extra_warnings, 0);
+}
+
+/**
+ * @brief Push two static tensors to a trainer that expects two inputs and a label.
+ */
+TEST_F (TensorTrainerFakeFw, fewerTensorsThanMultipleInputs_n)
+{
+  TrainerCountResult result;
+
+  trainer_count_push (2, 1, 2, 2, 1, &result);
+  EXPECT_EQ (result.ret, GST_FLOW_ERROR);
+  EXPECT_EQ (result.push_calls, 0);
+  EXPECT_EQ (result.missing_tensors, 0U);
+  EXPECT_EQ (result.extra_warnings, 0);
+}
+
+/**
+ * @brief Push one flexible tensor to a trainer that expects an input and a label.
+ */
+TEST_F (TensorTrainerFakeFw, flexibleFewerTensorsThanInputsAndLabels_n)
+{
+  TrainerCountResult result;
+
+  trainer_count_push (1, 1, 0, 1, 1, &result);
+  EXPECT_EQ (result.ret, GST_FLOW_ERROR);
+  EXPECT_EQ (result.push_calls, 0);
+  EXPECT_EQ (result.missing_tensors, 0U);
+  EXPECT_EQ (result.extra_warnings, 0);
+}
+
+/**
+ * @brief Push more static tensors than the caps announce.
+ *
+ * The count is enough for num-inputs + num-labels, so it is the check
+ * against the negotiated caps that refuses the buffer.
+ */
+TEST_F (TensorTrainerFakeFw, moreTensorsThanCaps_n)
+{
+  TrainerCountResult result;
+
+  trainer_count_push (1, 1, 2, 3, 1, &result);
+  EXPECT_EQ (result.ret, GST_FLOW_ERROR);
+  EXPECT_EQ (result.push_calls, 0);
 }
 
 /**

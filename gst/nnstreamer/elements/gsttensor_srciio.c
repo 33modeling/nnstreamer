@@ -726,6 +726,7 @@ gst_tensor_src_iio_set_channel_type (GstTensorSrcIIOChannelProperties * prop,
   gchar endianchar = '\0', signchar = '\0';
   gchar *start, *end;
   guint base = 10;
+  guint64 used_bits;
   errno = 0;
 
   /** check endian */
@@ -754,10 +755,11 @@ gst_tensor_src_iio_set_channel_type (GstTensorSrcIIOChannelProperties * prop,
 
   /** used bits */
   start = (gchar *) contents + 4;
-  prop->used_bits = (guint) g_ascii_strtoull (start, &end, base);
-  if (errno != 0) {
+  used_bits = g_ascii_strtoull (start, &end, base);
+  if (errno != 0 || used_bits == 0 || used_bits > 64) {
     goto exit_fail;
   }
+  prop->used_bits = (guint) used_bits;
   /** verify static parts of the contents */
   g_return_val_if_fail (end[0] == '/', FALSE);
   prop->mask = G_MAXUINT64 >> (64 - prop->used_bits);
@@ -807,7 +809,8 @@ gst_tensor_src_iio_get_generic_name (const gchar * channel_name)
   gchar *generic_name;
   gsize channel_name_len = strlen (channel_name);
 
-  while (g_ascii_isdigit (channel_name[channel_name_len - digit_len])) {
+  while (digit_len <= channel_name_len
+      && g_ascii_isdigit (channel_name[channel_name_len - digit_len])) {
     digit_len++;
   }
   generic_name = g_strndup (channel_name, channel_name_len - digit_len + 1);
@@ -1203,37 +1206,41 @@ gst_tensor_src_iio_set_property (GObject * object, guint prop_id,
         gchar **strv;
         gchar *endptr = NULL;
         gboolean status = TRUE;
+        GHashTable *table;
 
         /**
          * using direct as we only need to store keys
          * and keys form a unique set
          */
-        self->custom_channel_table =
-            g_hash_table_new (g_direct_hash, g_direct_equal);
+        table = g_hash_table_new (g_direct_hash, g_direct_equal);
         strv = g_strsplit_set (param, ",;", -1);
         num = g_strv_length (strv);
         for (i = 0; i < num; i++) {
+          errno = 0;
           val = g_ascii_strtoll (strv[i], &endptr, 10);
           if (errno == ERANGE || errno == EINVAL || (endptr == strv[i]
-                  && val == 0)) {
+                  && val == 0) || val < 0 || val > G_MAXINT) {
             GST_ERROR_OBJECT (self,
                 "Cannot parse received custom channels %s. The property values for CHANNELS are ignored.",
                 param);
-            g_hash_table_destroy (self->custom_channel_table);
-            self->custom_channel_table = NULL;
             status = FALSE;
             break;
           }
-          if (!g_hash_table_insert (self->custom_channel_table,
-                  GINT_TO_POINTER (val), NULL)) {
+          if (!g_hash_table_insert (table, GINT_TO_POINTER (val), NULL)) {
             /** this means val is duplicated. just skip it, then. */
             ml_logw
                 ("tensor-src-iio's CHANNELS property value has a duplicated entry, '%s', which is registered only once.\n",
                 strv[i]);
           }
         }
-        if (status)
+        if (status) {
+          if (self->custom_channel_table)
+            g_hash_table_destroy (self->custom_channel_table);
+          self->custom_channel_table = table;
           self->channels_enabled = CHANNELS_ENABLED_CUSTOM;
+        } else {
+          g_hash_table_destroy (table);
+        }
         g_strfreev (strv);
         break;
       }
@@ -1311,6 +1318,8 @@ gst_tensor_src_iio_get_property (GObject * object, guint prop_id,
         g_value_set_string (value, CHANNELS_ENABLED_ALL_CHAR);
       } else if (self->channels_enabled == CHANNELS_ENABLED_AUTO) {
         g_value_set_string (value, CHANNELS_ENABLED_AUTO_CHAR);
+      } else if (self->custom_channel_table == NULL) {
+        g_value_set_string (value, "");
       } else {
         GHashTableIter iter;
         gpointer key;
@@ -1890,6 +1899,13 @@ gst_tensor_src_iio_setup_scan_channels (GstTensorSrcIIO * self)
   self->scan_size = gst_tensor_get_size_from_channels (self->channels);
   self->num_channels_enabled = g_list_length (self->channels);
 
+  if ((guint64) self->scan_size * self->buffer_capacity > G_MAXINT) {
+    GST_ERROR_OBJECT (self,
+        "A buffer capacity of %u scans of %u bytes each exceeds the %d bytes which can be read at once.",
+        self->buffer_capacity, self->scan_size, G_MAXINT);
+    goto error_channels_free;
+  }
+
   /** set fixed caps for the src pad */
   gst_pad_use_fixed_caps (GST_BASE_SRC (self)->srcpad);
 
@@ -2376,6 +2392,8 @@ error:
  * @returns FALSE if fail, else TRUE
  *
  * assumes each data starting point is byte aligned
+ * @note a channel may be stored in 3, 5, 6 or 7 bytes, so only the bytes the
+ * channel occupies are read into the container of the next larger size
  */
 static gboolean
 gst_tensor_src_iio_process_scanned_data (GstTensorSrcIIOChannelProperties *
@@ -2413,7 +2431,8 @@ gst_tensor_src_iio_process_scanned_data (GstTensorSrcIIOChannelProperties *
       /** follow through */
     case 4:
     {
-      guint32 value = *(guint32 *) (data + prop->location);
+      guint32 value = 0;
+      memcpy (&value, data + prop->location, prop->storage_bytes);
       if (prop->big_endian) {
         value = GUINT32_FROM_BE (value);
           /** right shift the extra storage bits for big endian */
@@ -2436,7 +2455,8 @@ gst_tensor_src_iio_process_scanned_data (GstTensorSrcIIOChannelProperties *
       /** follow through */
     case 8:
     {
-      guint64 value = *(guint64 *) (data + prop->location);
+      guint64 value = 0;
+      memcpy (&value, data + prop->location, prop->storage_bytes);
       if (prop->big_endian) {
         value = GUINT64_FROM_BE (value);
           /** right shift the extra storage bits for big endian */

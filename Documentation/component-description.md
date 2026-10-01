@@ -108,9 +108,11 @@ In this page, we focus on the status of each elements. For requirements and desi
   - Users can adjust sync-mode and sync-option to change its behaviors of when to create output tensors and how to choose input tensors.
   - Users can adjust how dimensions are merged (the rank merged, the order of merged streams).
   - The incoming streams must share the type and every dimension except the one being merged, and merging is defined over four dimensions, so every stream should declare all four (```dimensions=3:640:480:1```, not ```dimensions=3:640:480```). A stream that disagrees, or whose shape does not fit those four dimensions, is refused — while the caps are negotiated when the disagreement is visible there, and when its first buffer arrives otherwise.
-- [tensor\_split](https://github.com/nnstreamer/nnstreamer/tree/main/gst/nnstreamer/elements/gsttensor_split.c) (stable)
+- [tensor\_split](https://github.com/nnstreamer/nnstreamer/tree/main/gst/nnstreamer/elements/gsttensor_split.md) (stable)
   - This is the opposite of ```tensor_merge```. This splits a single-tensored (```other/tensors,num_tensors=1```) stream into multiple single-tensored streams. For example, a stream of ```dimensions=1920:1080``` may split into ```dimensions=1080:1080``` and ```dimensions=840:1080```.
   - Users can adjust how dimensions are split
+  - Users may output only some of the segments with ```tensorpick```. With the properties set before the stream starts, the picked segments go out on ```src_0```, ```src_1```, ... in ascending segment order, and each pad describes the segment it carries: with ```tensorseg=1:4:4,2:4:4 tensorpick=1```, ```src_0``` carries ```dimensions=2:4:4```.
+  - ```tensorseg``` and ```tensorpick``` are fixed by the first buffer that is split; setting either to a different rule while the pipeline runs is refused with a warning on the bus, so stop the pipeline to ```READY``` or ```NULL``` to change them. An input renegotiated by upstream is followed instead: a source pad keeps the dimensions of its segment and takes the new type and framerate.
 - [tensor\_mux](https://github.com/nnstreamer/nnstreamer/tree/main/gst/nnstreamer/elements/gsttensor_mux.c) (stable)
   - This combines multiple ```other/tensor(s)``` streams into a single ```other/tensors``` stream while keeping the input stream dimensions. Thus, the number of tensors (```num_tensors```) increase accordingly without changing dimensions of incoming tensors. For example, merging the two tensor streams, ```num_tensors=1,dimensions=3:2``` and ```num_tensors=1,dimensions=4:4:4``` becomes ```num_tensors=2,dimensions=3:2,4:4:4```, combining frames from the two streams, enforcing synchronization.
   - Both merge and mux combine multiple streams into a stream; however, merge combines multiple tensors into a tensor, updating the dimensions while mux keep the tensors and combine them into a single container.
@@ -153,7 +155,7 @@ In this page, we focus on the status of each elements. For requirements and desi
 - [tensor\_src\_tizensensor](https://github.com/nnstreamer/nnstreamer/tree/main/ext/nnstreamer/tensor_source) (stable)
   - This element imports data from Tizen sensor framework, which can provide sensor-fusion service, and generates tensor stream from it. Obviously, this works only in Tizen.
 - [tensor\_src\_grpc](https://github.com/nnstreamer/nnstreamer/tree/main/ext/nnstreamer/tensor_source) (stable)
-  - This element generates tensor streams from data received via grpc connection.
+  - This element generates tensor streams from data received via grpc connection. A received message whose tensor count or data sizes do not match the negotiated caps is dropped.
 - [tensor\_sink\_grpc](https://github.com/nnstreamer/nnstreamer/tree/main/ext/nnstreamer/tensor_sink) (stable)
   - This element sends data via grpc connection from tensor streams.
 - [android supports](https://github.com/nnstreamer/nnstreamer/tree/main/ext/nnstreamer/android_source) (stable)
