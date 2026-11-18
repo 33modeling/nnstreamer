@@ -93,6 +93,8 @@ jobs:
 
     - if: matrix.gbs_build_arch == 'x86_64' && steps.gbs-build.outcome == 'success'
       name: update test coverage result to github.io
+      id: publish-coverage
+      continue-on-error: true
       uses: ./.github/actions/gitpush
       with:
         source: ~/testresult/usr/share/nnstreamer/unittest/result/*
@@ -100,6 +102,12 @@ jobs:
         message: "${{ steps.get-date.outputs.date }} : Update test coverage result."
         taos_account: ${{ secrets.TAOS_ACCOUNT }}
         taos_account_token: ${{ secrets.TAOS_ACCOUNT_TOKEN }}
+
+    - if: steps.publish-coverage.outcome == 'failure'
+      name: Report coverage publication failure
+      run: |
+        echo "::warning::Coverage publication failed. See the coverage publication step for details."
+        echo "Coverage publication failed. See the coverage publication step for details." >> "$GITHUB_STEP_SUMMARY"
 
     - name: Get nntrainer
       uses: actions/checkout@v4
